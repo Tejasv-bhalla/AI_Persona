@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: rag-persona-backend
+    env: docker
+    rootDir: backend
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: false
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: GROQ_API_KEY
+        sync: false
+      - key: QDRANT_URL
+        sync: false
+      - key: QDRANT_API_KEY
+        sync: false
+      - key: QDRANT_COLLECTION
+        value: tejasv_knowledge_base
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: CALCOM_API_KEY
+        sync: false
+      - key: CALCOM_EVENT_TYPE_ID
+        sync: false
+      - key: CALCOM_USERNAME
+        sync: false
+      - key: GROQ_GUARD_MODEL
+        value: llama-3.1-8b-instant
+      - key: GROQ_GENERATION_MODEL
+        value: llama-3.3-70b-versatile
+      - key: GROQ_GRADER_MODEL
+        value: llama-3.3-70b-versatile
