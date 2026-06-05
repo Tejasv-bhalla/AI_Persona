@@ -20,7 +20,8 @@ type ChatEvent = {
   available_slots?: string[];
 };
 
-const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
+const rawApiUrl = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
+const apiBaseUrl = rawApiUrl.endsWith("/") ? rawApiUrl.slice(0, -1) : rawApiUrl;
 
 function makeId(): string {
   return crypto.randomUUID();
