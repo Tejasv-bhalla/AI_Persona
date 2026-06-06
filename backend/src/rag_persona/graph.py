@@ -46,6 +46,7 @@ def build_graph(
             "scheduling": "calcom",
             "small_talk": "smalltalk",
             "refusal": END,
+            "end_call": END,
         },
     )
     graph.add_edge("retrieval", END)

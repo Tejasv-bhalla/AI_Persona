@@ -7,13 +7,40 @@ from rag_persona.services.calcom import CalComClient
 logger = logging.getLogger(__name__)
 
 
+def format_ordinal(day: int) -> str:
+    if 11 <= day <= 13:
+        return f"{day}th"
+    return f"{day}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(day % 10, 'th') }"
+
+
+def to_spoken_slot(slot_str: str) -> str:
+    try:
+        dt = datetime.fromisoformat(slot_str.replace("Z", "+00:00"))
+        day_str = format_ordinal(dt.day)
+        time_str = dt.strftime("%I:%M %p").lstrip("0")
+        if time_str.endswith(":00 AM"):
+            time_str = time_str.replace(":00", "")
+        elif time_str.endswith(":00 PM"):
+            time_str = time_str.replace(":00", "")
+        return f"{dt.strftime('%A, %B')} {day_str} at {time_str}"
+    except Exception:
+        return slot_str
+
+
 async def calcom_node(
     state: PersonaState,
     settings,
     calcom: CalComClient | None,
 ) -> PersonaState:
     username = settings.calcom_username or "tejasv"
+    mode = state.get("mode", "chat")
+
     if calcom is None or not calcom.configured:
+        if mode == "voice":
+            return {
+                **state,
+                "answer": f"I'm having a bit of trouble accessing the calendar right now. You can book directly at cal.com/{username} — Tejasv has good availability and would love to connect.",
+            }
         return {
             **state,
             "answer": f"I'm having trouble accessing the calendar right now. You can book directly at cal.com/{username}",
@@ -41,15 +68,38 @@ async def calcom_node(
 
         slots = slots[:5]
         if not slots:
+            if mode == "voice":
+                return {
+                    **state,
+                    "answer": f"I couldn't find any available slots in the next seven days. You can check my calendar directly at cal.com/{username}.",
+                }
             return {
                 **state,
                 "answer": f"I couldn't find any available slots in the next 7 days. You can check my calendar directly at cal.com/{username}.",
             }
 
+        if mode == "voice":
+            spoken_slots = [to_spoken_slot(s) for s in slots[:3]]
+            if len(spoken_slots) == 1:
+                slots_phrase = spoken_slots[0]
+            elif len(spoken_slots) == 2:
+                slots_phrase = f"{spoken_slots[0]} or {spoken_slots[1]}"
+            else:
+                slots_phrase = f"{spoken_slots[0]}, {spoken_slots[1]}, or {spoken_slots[2]}"
+
+            answer = (
+                f"I have availability on {slots_phrase}. "
+                "Which of those works best for you?"
+            )
+            return {
+                **state,
+                "answer": answer,
+                "available_slots": slots,
+            }
+
         formatted_slots = []
         for slot in slots:
             try:
-                # 2026-06-05T10:00:00Z -> "Friday, June 05, 2026 at 10:00 AM"
                 dt = datetime.fromisoformat(slot.replace("Z", "+00:00"))
                 formatted_slots.append(dt.strftime("%A, %B %d, %Y at %I:%M %p"))
             except Exception:
@@ -66,12 +116,18 @@ async def calcom_node(
         return {
             **state,
             "answer": answer,
-            "available_slots": slots,  # We can inject this into state
+            "available_slots": slots,
         }
 
     except Exception:
         logger.exception("Failed to fetch slots from Cal.com")
+        if mode == "voice":
+            return {
+                **state,
+                "answer": f"I'm having a bit of trouble accessing the calendar right now. You can book directly at cal.com/{username} — Tejasv has good availability and would love to connect.",
+            }
         return {
             **state,
             "answer": f"I'm having trouble accessing the calendar right now. You can book directly at cal.com/{username}",
         }
+

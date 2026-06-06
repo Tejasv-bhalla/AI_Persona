@@ -4,6 +4,7 @@ from rag_persona.schemas import PersonaState, RetrievedChunk
 from rag_persona.services.embeddings import EmbeddingService
 from rag_persona.services.qdrant_store import QdrantStore
 from rag_persona.services.reranker import rerank_by_cosine
+from rag_persona.voice.response_cache import get_cached_response, set_cached_response
 
 
 def extract_repo_filter(text: str) -> str | None:
@@ -32,17 +33,28 @@ async def retrieval_node(
         return {**state, "chunks": []}
 
     guard = state["guard"]
+    mode = state.get("mode", "chat")
+
+    # Cache lookup for voice mode
+    if mode == "voice" and guard.keywords:
+        cached = get_cached_response(guard.keywords, ttl_seconds=settings.voice_cache_ttl_seconds)
+        if cached:
+            return {**state, "chunks": cached["chunks"]}
+
     raw_input = state.get("raw_input", "")
     repo_filter = extract_repo_filter(raw_input) or extract_repo_filter(guard.keywords)
 
     query_vector = embeddings.embed_one(guard.keywords)
+    
+    # Restrict retrieval limit in voice mode
+    limit = 5 if mode == "voice" else settings.max_retrieval_candidates
     try:
         candidates = store.search(
             query_vector=query_vector,
             sparse_query=encode_sparse_query(guard.keywords),
             source_filter=guard.source_filter,
             repo_filter=repo_filter,
-            limit=settings.max_retrieval_candidates,
+            limit=limit,
         )
     except Exception:
         return {**state, "chunks": []}
@@ -64,4 +76,9 @@ async def retrieval_node(
     else:
         chunks = candidates[: settings.max_context_chunks]
 
+    # Populate cache for voice mode
+    if mode == "voice" and guard.keywords and chunks:
+        set_cached_response(guard.keywords, chunks)
+
     return {**state, "chunks": chunks}
+

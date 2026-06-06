@@ -14,6 +14,7 @@ class Intent(StrEnum):
     rag = "rag"
     scheduling = "scheduling"
     small_talk = "small_talk"
+    end_call = "end_call"
 
 
 class SourceType(StrEnum):
@@ -78,3 +79,5 @@ class PersonaState(TypedDict, total=False):
     answer: str
     correction_pending: bool
     available_slots: list[str]
+    mode: Literal["chat", "voice"]
+

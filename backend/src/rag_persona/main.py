@@ -4,7 +4,8 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import FastAPI
+import logging
+from fastapi import FastAPI, Request, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
@@ -17,6 +18,10 @@ from rag_persona.services.calcom import CalComClient
 from rag_persona.services.embeddings import EmbeddingService
 from rag_persona.services.groq_client import GroqClient
 from rag_persona.services.qdrant_store import QdrantStore
+from rag_persona.voice.vapi_adapter import parse_vapi_request, format_vapi_response_stream
+
+logger = logging.getLogger(__name__)
+
 
 
 def try_build_services(settings: Settings) -> dict[str, Any]:
@@ -59,8 +64,15 @@ def sse(event: ChatEvent) -> str:
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok", "timestamp": datetime.now(UTC).isoformat()}
+async def health() -> dict[str, Any]:
+    settings = getattr(app.state, "settings", None)
+    vapi_id = settings.vapi_assistant_id if settings else None
+    return {
+        "status": "ok",
+        "timestamp": datetime.now(UTC).isoformat(),
+        "voice": "configured" if vapi_id else "not_configured",
+        "vapi_assistant_id": vapi_id or None,
+    }
 
 
 @app.get("/warm")
@@ -122,4 +134,76 @@ async def book_slot(request: BookingRequest) -> dict[str, object]:
         return {"status": "success", "booking": result}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+@app.post("/voice")
+async def voice_endpoint(request: Request) -> StreamingResponse:
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    raw_input, history = parse_vapi_request(payload)
+
+    initial_state: PersonaState = {
+        "raw_input": raw_input,
+        "conversation_history": history,
+        "mode": "voice",
+    }
+
+    state: PersonaState = await app.state.graph.ainvoke(initial_state)
+
+    token_stream = stream_generator_node(
+        state=state,
+        settings=app.state.settings,
+        groq=app.state.services.get("groq"),
+    )
+
+    vapi_stream = format_vapi_response_stream(token_stream)
+
+    return StreamingResponse(
+        vapi_stream,
+        media_type="application/x-ndjson",
+        headers={
+            "Transfer-Encoding": "chunked",
+        },
+    )
+
+
+@app.post("/vapi-webhook")
+async def vapi_webhook(
+    request: Request,
+    x_vapi_secret: str | None = Header(default=None, alias="x-vapi-secret"),
+) -> dict[str, str]:
+    settings = getattr(app.state, "settings", None)
+    expected_secret = settings.vapi_webhook_secret if settings else ""
+
+    if expected_secret and x_vapi_secret != expected_secret:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid x-vapi-secret header",
+        )
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    message = payload.get("message", {})
+    event_type = message.get("type")
+    call_id = message.get("call", {}).get("id")
+
+    if event_type == "call-started":
+        logger.info(f"Vapi Call Started: {call_id} at {message.get('timestamp')}")
+    elif event_type == "call-ended":
+        logger.info(
+            f"Vapi Call Ended: {call_id}. Duration: {message.get('duration')}s. "
+            f"End reason: {message.get('endedReason')}"
+        )
+    elif event_type == "transcript":
+        logger.info(f"Vapi Call {call_id} Transcript: {message.get('transcript')}")
+    else:
+        logger.info(f"Vapi webhook received event: {event_type} for call: {call_id}")
+
+    return {"status": "ok"}
 

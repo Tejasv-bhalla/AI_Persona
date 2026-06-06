@@ -9,7 +9,10 @@ def route_from_state(state: PersonaState) -> str:
         return "scheduling"
     if guard.intent == Intent.small_talk:
         return "small_talk"
+    if guard.intent == Intent.end_call:
+        return "end_call"
     return "rag"
+
 
 
 async def router_node(state: PersonaState) -> PersonaState:

@@ -6,7 +6,7 @@ The updated ingestion blueprint separates **local ingestion credentials** from *
 
 Save these in:
 
-`/Users/tejasv/Desktop/AI_Person(Scaler)/ingestion/.env`
+`/Users/tejasv/Desktop/AI_Persona/ingestion/.env`
 
 ```env
 GITHUB_TOKEN=your-github-token
@@ -28,7 +28,7 @@ GitHub token scope needed: `public_repo` only.
 
 Save these locally in:
 
-`/Users/tejasv/Desktop/AI_Person(Scaler)/backend/.env`
+`/Users/tejasv/Desktop/AI_Persona/backend/.env`
 
 Set the same values in Render for production:
 
@@ -38,6 +38,12 @@ QDRANT_URL=https://your-qdrant-cluster-url
 QDRANT_API_KEY=your-qdrant-api-key
 QDRANT_COLLECTION=tejasv_knowledge_base
 ALLOWED_ORIGINS=http://localhost:5173
+
+# Vapi Integration Keys (Optional locally, required in Render for Webhooks)
+VAPI_API_KEY=your-vapi-api-key
+VAPI_PHONE_NUMBER_ID=your-vapi-phone-number-id
+VAPI_ASSISTANT_ID=your-vapi-assistant-id
+VAPI_WEBHOOK_SECRET=your-vapi-webhook-secret
 ```
 
 Optional scheduling keys:
@@ -54,7 +60,7 @@ The Render backend does **not** need `GITHUB_TOKEN` or `GITHUB_USERNAME`; it nev
 
 Save locally in:
 
-`/Users/tejasv/Desktop/AI_Person(Scaler)/frontend/.env`
+`/Users/tejasv/Desktop/AI_Persona/frontend/.env`
 
 Set the same key in Vercel:
 
@@ -68,7 +74,7 @@ For production, replace it with the Render backend URL.
 
 Before local ingestion, place files in:
 
-`/Users/tejasv/Desktop/AI_Person(Scaler)/ingestion/data`
+`/Users/tejasv/Desktop/AI_Persona/ingestion/data`
 
 Required:
 

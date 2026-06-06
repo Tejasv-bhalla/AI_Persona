@@ -33,6 +33,13 @@ class Settings(BaseSettings):
     max_context_chunks: int = 3
     request_timeout_seconds: float = 20.0
 
+    vapi_api_key: str = Field(default="", repr=False)
+    vapi_phone_number_id: str = ""
+    vapi_assistant_id: str = ""
+    vapi_webhook_secret: str = Field(default="", repr=False)
+    voice_max_response_words: int = 80
+    voice_cache_ttl_seconds: int = 3600
+
     @property
     def cors_origins(self) -> list[str]:
         return [origin.strip() for origin in self.allowed_origins.split(",") if origin.strip()]
