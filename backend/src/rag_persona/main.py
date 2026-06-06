@@ -130,6 +130,38 @@ async def chat(request: ChatRequest) -> StreamingResponse:
     return StreamingResponse(events(), media_type="text/event-stream")
 
 
+@app.post("/chat/eval")
+async def chat_eval(request: ChatRequest) -> dict[str, Any]:
+    try:
+        initial_state: PersonaState = {
+            "raw_input": request.message,
+            "session_id": request.session_id,
+            "conversation_history": request.conversation_history,
+        }
+        state: PersonaState = await app.state.graph.ainvoke(initial_state)
+        
+        answer_parts: list[str] = []
+        async for token in stream_generator_node(
+            state=state,
+            settings=app.state.settings,
+            groq=app.state.services.get("groq"),
+        ):
+            answer_parts.append(token)
+        
+        answer = "".join(answer_parts)
+        retrieved_contexts = [chunk.text for chunk in state.get("chunks", [])]
+        
+        return {
+            "response": answer,
+            "retrieved_contexts": retrieved_contexts
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e),
+        )
+
+
 @app.post("/book")
 async def book_slot(request: BookingRequest) -> dict[str, object]:
     calcom = app.state.services.get("calcom")

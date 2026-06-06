@@ -1,0 +1,32 @@
+{
+  "total_questions": 10,
+  "median_first_token_latency_ms": 981.22,
+  "p95_first_token_latency_ms": 1786.4,
+  "ragas": {
+    "faithfulness": 0.967687074829932,
+    "answer_relevancy": 0.6741752992270253,
+    "context_precision": 0.5476190475785715,
+    "context_recall": 0.5714285714285714
+  },
+  "judge": {
+    "correct_rate": 60.0,
+    "hallucination_rate": 0.0,
+    "refusal_rate": 20.0,
+    "partial_rate": 20.0,
+    "counts": {
+      "correct": 6,
+      "partial": 2,
+      "hallucinated": 0,
+      "refused": 2
+    }
+  },
+  "collection_health": {
+    "unknown": 87,
+    "code": 941,
+    "notebook-output": 46,
+    "readme": 276,
+    "changelog": 12,
+    "resume": 5,
+    "contribution-scope": 4
+  }
+}

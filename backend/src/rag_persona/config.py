@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     app_env: str = "local"
     allowed_origins: str = "http://localhost:5173"
     dry_run: bool = False
+    repo_blocklist: list[str] = ["ai_person", "AI_Persona", "ai-persona"]
+
 
     groq_api_key: str = Field(default="", repr=False)
     groq_guard_model: str = "llama-3.1-8b-instant"

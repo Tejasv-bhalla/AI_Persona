@@ -102,8 +102,9 @@ async def discover_repositories(
                 is_external=False,
             )
             for repo in response.json()
-            if not repo.get("fork", False)
+            if not repo.get("fork", False) and repo["name"].lower() not in [r.lower() for r in settings.repo_blocklist]
         ]
+
 
         external: list[RepositorySpec] = []
         for url in external_urls:
