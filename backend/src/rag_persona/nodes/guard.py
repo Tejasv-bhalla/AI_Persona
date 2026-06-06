@@ -43,8 +43,34 @@ async def guard_node(
     raw_input = state["raw_input"]
     mode = state.get("mode", "chat")
     
+    # 1. Run hardcoded keyword check first as a mandatory failsafe
+    lowered = raw_input.lower()
+    malicious_markers = [
+        "ignore previous",
+        "ignore all previous",
+        "system prompt",
+        "developer message",
+        "jailbreak",
+        "reveal secrets",
+        "forget all instructions",
+        "forget previous",
+        "reveal your instructions",
+        "you are no longer",
+        "new instructions",
+        "stop simulating",
+    ]
+    if mode == "chat" and any(marker in lowered for marker in malicious_markers):
+        guard = GuardResult(
+            safety=SafetyVerdict.malicious,
+            intent=Intent.rag,
+            keywords="",
+            refusal_reason="The request attempts to override or extract protected instructions.",
+        )
+        return {**state, "guard": guard}
+
     if groq is None:
         guard = fallback_guard(raw_input, mode)
+
     else:
         if mode == "voice":
             result = await groq.json_completion(

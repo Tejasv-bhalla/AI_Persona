@@ -3,8 +3,9 @@ from rag_persona.schemas import Intent, PersonaState, SafetyVerdict
 
 def route_from_state(state: PersonaState) -> str:
     guard = state["guard"]
-    if guard.safety == SafetyVerdict.malicious:
+    if guard.safety in (SafetyVerdict.malicious, SafetyVerdict.suspicious):
         return "refusal"
+
         
     # Check if we are in voice mode and currently expecting an email response for scheduling
     mode = state.get("mode", "chat")

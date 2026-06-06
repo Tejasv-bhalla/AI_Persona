@@ -178,9 +178,17 @@ async def voice_endpoint(request: Request) -> StreamingResponse:
 
     async def cache_accumulator() -> AsyncIterator[str]:
         full_tokens = []
-        async for token in token_stream:
-            full_tokens.append(token)
-            yield token
+        try:
+            async for token in token_stream:
+                full_tokens.append(token)
+                yield token
+        except Exception as e:
+            logger.exception("Error occurred during voice session streaming")
+            error_msg = "I'm having a bit of trouble connecting to my brain right now, but please ask again in a moment."
+            if "rate_limit" in str(e).lower() or "429" in str(e):
+                error_msg = "I am experiencing a high volume of requests right now. Could you please repeat that in a few seconds?"
+            yield error_msg
+            return
 
         # After streaming completes, cache the full response if it is a new generation
         if "answer" not in state and state.get("mode") == "voice":
@@ -197,6 +205,7 @@ async def voice_endpoint(request: Request) -> StreamingResponse:
                     answer=full_answer,
                     vector=query_vector,
                 )
+
 
     vapi_stream = format_vapi_response_stream(cache_accumulator())
 

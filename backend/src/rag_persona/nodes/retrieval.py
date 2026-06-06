@@ -1,9 +1,9 @@
+import asyncio
 from rag_persona.config import Settings
 from rag_persona.ingestion.bm25 import encode_sparse_query
 from rag_persona.schemas import PersonaState, RetrievedChunk
 from rag_persona.services.embeddings import EmbeddingService
 from rag_persona.services.qdrant_store import QdrantStore
-from rag_persona.services.reranker import rerank_by_cosine
 from rag_persona.voice.response_cache import get_cached_response, set_cached_response
 
 
@@ -38,7 +38,8 @@ async def retrieval_node(
     raw_input = state.get("raw_input", "")
     repo_filter = extract_repo_filter(raw_input) or extract_repo_filter(guard.keywords)
 
-    query_vector = embeddings.embed_one(guard.keywords)
+    # Offload CPU-bound ONNX embedding inference to a thread pool to avoid blocking the event loop
+    query_vector = await asyncio.to_thread(embeddings.embed_one, guard.keywords)
     state["query_vector"] = query_vector
 
     # Cache lookup for voice mode
@@ -67,22 +68,10 @@ async def retrieval_node(
     except Exception:
         return {**state, "chunks": []}
 
-    candidate_vectors: dict[str, list[float]] = {}
-    for candidate in candidates:
-        vector = candidate.metadata.get("dense_vector")
-        if isinstance(vector, list):
-            candidate_vectors[candidate.chunk_id] = [float(item) for item in vector]
-
-    chunks: list[RetrievedChunk]
-    if candidate_vectors:
-        chunks = rerank_by_cosine(
-            query_vector=query_vector,
-            chunks=candidates,
-            candidate_vectors=candidate_vectors,
-            limit=settings.max_context_chunks,
-        )
-    else:
-        chunks = candidates[: settings.max_context_chunks]
+    # Return the Qdrant retrieved candidates directly.
+    # This preserves the sparse search RRF ranks and avoids redundant cosine similarity calculations.
+    chunks = candidates[: settings.max_context_chunks]
 
     return {**state, "chunks": chunks}
+
 
