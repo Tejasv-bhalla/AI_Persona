@@ -21,6 +21,9 @@ def route_from_state(state: PersonaState) -> str:
                 or "what email" in last_assistant_msg.lower() 
                 or "send the invitation to" in last_assistant_msg.lower() 
                 or "send the invite to" in last_assistant_msg.lower()
+                or "can i get your name" in last_assistant_msg.lower()
+                or "does that work for you" in last_assistant_msg.lower()
+                or "how about" in last_assistant_msg.lower()
             ):
                 return "scheduling"
 

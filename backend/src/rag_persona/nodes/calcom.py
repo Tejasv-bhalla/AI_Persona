@@ -186,33 +186,49 @@ async def calcom_node(
         # Handle voice email collection and booking
         if mode == "voice":
             history = state.get("conversation_history", [])
-            expecting_email = False
-            if history:
-                last_assistant_msg = ""
-                for msg in reversed(history):
-                    if msg.get("role") == "assistant":
-                        last_assistant_msg = msg.get("content", "")
-                        break
-                if last_assistant_msg and ("email address" in last_assistant_msg.lower() or "what email" in last_assistant_msg.lower() or "send the invitation to" in last_assistant_msg.lower() or "send the invite to" in last_assistant_msg.lower()):
-                    expecting_email = True
+            
+            # Determine conversational state from history
+            last_assistant_msg = ""
+            for msg in reversed(history):
+                if msg.get("role") == "assistant":
+                    last_assistant_msg = msg.get("content", "")
+                    break
 
-            if expecting_email:
+            # Helper to extract name
+            def extract_name(text: str) -> str:
+                clean = text.strip()
+                prefixes = ["my name is", "this is", "i am", "sure, my name is", "sure, this is", "it is", "its"]
+                lowered = clean.lower()
+                for prefix in prefixes:
+                    if lowered.startswith(prefix):
+                        clean = clean[len(prefix):].strip()
+                        break
+                return clean.title()
+
+            # State A: Expecting email
+            if last_assistant_msg and ("email address" in last_assistant_msg.lower() or "what email" in last_assistant_msg.lower() or "send the invitation to" in last_assistant_msg.lower() or "send the invite to" in last_assistant_msg.lower()):
                 email = extract_email(raw_input)
                 if email:
-                    # Retrieve the selected slot from conversation history
+                    # Find name from history
+                    name = "Recruiter"
+                    for msg in reversed(history):
+                        if msg.get("role") == "assistant" and "can i get your name first" in msg.get("content", "").lower():
+                            idx = history.index(msg)
+                            if idx + 1 < len(history) and history[idx + 1].get("role") == "user":
+                                name = extract_name(history[idx + 1].get("content", ""))
+                                break
+
+                    # Find selected slot from history
                     selected_slot = None
                     for msg in reversed(history):
-                        if msg.get("role") == "assistant" and "I can book" in msg.get("content", ""):
-                            idx = history.index(msg)
-                            for j in range(idx - 1, -1, -1):
-                                if history[j].get("role") == "user":
-                                    selected_slot = detect_slot_selection(history[j].get("content", ""), slots)
-                                    if selected_slot:
-                                        break
+                        if msg.get("role") == "assistant" and ("does that work for you" in msg.get("content", "").lower() or "how about" in msg.get("content", "").lower()):
+                            for s in slots:
+                                if to_spoken_slot(s).lower() in msg.get("content", "").lower():
+                                    selected_slot = s
+                                    break
                             if selected_slot:
                                 break
-                    
-                    # Fallback to first available if not found
+
                     if not selected_slot and slots:
                         selected_slot = slots[0]
 
@@ -222,19 +238,19 @@ async def calcom_node(
                         try:
                             req = BookingRequest(
                                 preferred_time=selected_slot,
-                                attendee_name="Phone Recruiter",
+                                attendee_name=name,
                                 attendee_email=email,
                                 notes="Booked via Portfolio Voice Agent."
                             )
                             await calcom.create_booking(req)
-                            answer = f"Perfect! I've booked our meeting for {spoken_date} and sent the calendar invitation to {email}. You should receive it in a few moments. Is there anything else I can help you with?"
+                            answer = f"Perfect! I've booked our meeting for {spoken_date} and sent the calendar invitation to {email}. You're all set! Is there anything else I can help you with?"
                             return {
                                 **state,
                                 "answer": answer,
                                 "selected_slot": selected_slot,
                                 "booking_confirmed": True
                             }
-                        except Exception as e:
+                        except Exception:
                             logger.exception("Failed to create Cal.com booking")
                             answer = f"I ran into an issue finalizing the booking on the calendar. However, I have saved your preference for {spoken_date} at {email}. You can also visit cal.com/{username} to secure it."
                             return {
@@ -242,7 +258,7 @@ async def calcom_node(
                                 "answer": answer,
                             }
                     else:
-                        answer = "I'm sorry, I lost track of which slot you selected. Which time works best for you again?"
+                        answer = f"I'm sorry, I lost track of which slot you selected. You can book directly at cal.com/{username}."
                         return {
                             **state,
                             "answer": answer,
@@ -254,40 +270,65 @@ async def calcom_node(
                         "answer": answer,
                     }
 
-            # Check if user is selecting a slot
-            selected = detect_slot_selection(raw_input, slots)
-            if selected:
-                spoken_date = to_spoken_slot(selected)
-                answer = f"Great! I can book {spoken_date} for you. What email address should I send the calendar invitation to?"
+            # State B: Expecting name
+            elif last_assistant_msg and "can i get your name first" in last_assistant_msg.lower():
+                name = extract_name(raw_input)
+                answer = f"Thanks, {name}. And what email address should I send the calendar invitation to?"
                 return {
                     **state,
                     "answer": answer,
-                    "selected_slot": selected,
                 }
-        if not slots:
-            if mode == "voice":
-                return {
-                    **state,
-                    "answer": f"I couldn't find any available slots in the next seven days. You can check my calendar directly at cal.com/{username}.",
-                }
-            return {
-                **state,
-                "answer": f"I couldn't find any available slots in the next 7 days. You can check my calendar directly at cal.com/{username}.",
-            }
 
-        if mode == "voice":
-            spoken_slots = [to_spoken_slot(s) for s in slots[:3]]
-            if len(spoken_slots) == 1:
-                slots_phrase = spoken_slots[0]
-            elif len(spoken_slots) == 2:
-                slots_phrase = f"{spoken_slots[0]} or {spoken_slots[1]}"
+            # State C: Negotiating slots (offering one by one)
+            elif last_assistant_msg and ("does that work for you" in last_assistant_msg.lower() or "how about" in last_assistant_msg.lower()):
+                negatives = ["no", "nope", "does not work", "doesn't work", "cannot do", "can't do", "other time", "different time", "next"]
+                user_rejected = any(neg in raw_input.lower() for neg in negatives)
+
+                last_offered_idx = -1
+                for s_idx, s in enumerate(slots):
+                    if to_spoken_slot(s).lower() in last_assistant_msg.lower():
+                        last_offered_idx = s_idx
+                        break
+
+                if user_rejected:
+                    next_idx = last_offered_idx + 1
+                    if next_idx < len(slots):
+                        next_spoken = to_spoken_slot(slots[next_idx])
+                        answer = f"No problem. How about {next_spoken}?"
+                        return {
+                            **state,
+                            "answer": answer,
+                        }
+                    else:
+                        answer = f"Those are all the slots I have in the near future. You can check my full calendar at cal.com/{username} to find another time."
+                        return {
+                            **state,
+                            "answer": answer,
+                        }
+                else:
+                    answer = "Great! Can I get your name first?"
+                    return {
+                        **state,
+                        "answer": answer,
+                    }
+
+            # State D: Start slot negotiation (offer the first slot)
             else:
-                slots_phrase = f"{spoken_slots[0]}, {spoken_slots[1]}, or {spoken_slots[2]}"
+                if slots:
+                    first_spoken = to_spoken_slot(slots[0])
+                    answer = f"My next available slot is {first_spoken}. Does that work for you?"
+                    return {
+                        **state,
+                        "answer": answer,
+                        "available_slots": slots,
+                    }
+                else:
+                    answer = f"I couldn't find any available slots in the next seven days. You can check my calendar directly at cal.com/{username}."
+                    return {
+                        **state,
+                        "answer": answer,
+                    }
 
-            answer = (
-                f"I have availability on {slots_phrase}. "
-                "Which of those works best for you?"
-            )
             return {
                 **state,
                 "answer": answer,
