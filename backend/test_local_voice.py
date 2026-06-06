@@ -27,16 +27,22 @@ try:
             print(f"Error: Server returned status code {r.status_code}")
             print(r.read().decode())
         else:
-            print("Streamed Sentences (Vapi Format):")
+            print("Streamed Sentences (OpenAI SSE Format):")
             print("-" * 50)
             for line in r.iter_lines():
-                if line:
+                if line.startswith("data: "):
+                    content_str = line[6:].strip()
+                    if content_str == "[DONE]":
+                        print("[assistant]: [DONE]")
+                        continue
                     try:
-                        data = json.loads(line)
-                        role = data.get("role", "assistant")
-                        content = data.get("content", "")
-                        stop = data.get("stop", False)
-                        print(f"[{role}]: {content} (stop={stop})")
+                        data = json.loads(content_str)
+                        choices = data.get("choices", [])
+                        if choices:
+                            delta = choices[0].get("delta", {})
+                            content = delta.get("content", "")
+                            if content:
+                                print(f"[assistant]: {content.strip()}")
                     except Exception as parse_err:
                         print(f"Failed to parse line: {line} - {parse_err}")
             print("-" * 50)

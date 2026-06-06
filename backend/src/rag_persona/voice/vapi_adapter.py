@@ -40,12 +40,12 @@ def parse_vapi_request(payload: dict[str, Any]) -> tuple[str, list[dict[str, str
 async def format_vapi_response_stream(token_stream: AsyncIterator[str]) -> AsyncIterator[str]:
     """
     Aggregates a stream of tokens into complete sentences.
-    Streams each sentence as an NDJSON line. Marks the final sentence with "stop": True.
+    Streams each sentence as an OpenAI-compatible SSE chunk.
+    Signals completion with data: [DONE].
     """
     buffer = ""
     # Matches complete sentences, handling decimal points (e.g. 8.5) and abbreviations/domains (e.g. cal.com) without splitting
     sentence_end_regex = re.compile(r"^((?:[^.!?\n]|[.!?](?!\s))*?[.!?]+(?=\s))")
-    last_sentence = None
 
     async for token in token_stream:
         buffer += token
@@ -60,25 +60,31 @@ async def format_vapi_response_stream(token_stream: AsyncIterator[str]) -> Async
 
             clean_sentence = sentence.strip()
             if clean_sentence:
-                if last_sentence is not None:
-                    # Yield deferred previous sentence
-                    chunk = {"role": "assistant", "content": last_sentence}
-                    yield json.dumps(chunk) + "\n"
-                last_sentence = clean_sentence
+                chunk = {
+                    "choices": [
+                        {
+                            "delta": {
+                                "content": clean_sentence + " "
+                            }
+                        }
+                    ]
+                }
+                yield f"data: {json.dumps(chunk)}\n\n"
 
     # Handle any remaining text left in buffer
     remaining = buffer.strip()
     if remaining:
-        if last_sentence is not None:
-            chunk = {"role": "assistant", "content": last_sentence}
-            yield json.dumps(chunk) + "\n"
-        last_sentence = remaining
+        chunk = {
+            "choices": [
+                {
+                    "delta": {
+                        "content": remaining + " "
+                    }
+                }
+            ]
+        }
+        yield f"data: {json.dumps(chunk)}\n\n"
 
-    # Yield the final sentence with stop: True
-    if last_sentence is not None:
-        chunk = {"role": "assistant", "content": last_sentence, "stop": True}
-        yield json.dumps(chunk) + "\n"
-    else:
-        # Graceful fallback if no text was generated
-        chunk = {"role": "assistant", "content": "", "stop": True}
-        yield json.dumps(chunk) + "\n"
+    # Final OpenAI stream done signal
+    yield "data: [DONE]\n\n"
+

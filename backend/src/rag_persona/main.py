@@ -164,9 +164,10 @@ async def voice_endpoint(request: Request) -> StreamingResponse:
 
     return StreamingResponse(
         vapi_stream,
-        media_type="application/x-ndjson",
+        media_type="text/event-stream",
         headers={
-            "Transfer-Encoding": "chunked",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
         },
     )
 
