@@ -80,4 +80,6 @@ class PersonaState(TypedDict, total=False):
     correction_pending: bool
     available_slots: list[str]
     mode: Literal["chat", "voice"]
+    customer_number: str
+    selected_slot: str
 

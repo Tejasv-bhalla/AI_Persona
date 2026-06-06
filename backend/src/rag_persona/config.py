@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     vapi_webhook_secret: str = Field(default="", repr=False)
     voice_max_response_words: int = 80
     voice_cache_ttl_seconds: int = 3600
+    twilio_sid: str = ""
+    twilio_token: str = Field(default="", repr=False)
+    twilio_from: str = ""
 
     @property
     def cors_origins(self) -> list[str]:

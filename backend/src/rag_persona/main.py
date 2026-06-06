@@ -152,10 +152,20 @@ async def voice_endpoint(request: Request) -> StreamingResponse:
 
     raw_input, history = parse_vapi_request(payload)
 
+    message_obj = payload.get("message", {})
+    call_obj = message_obj.get("call", {}) if isinstance(message_obj, dict) else {}
+    if not call_obj and isinstance(payload, dict):
+        call_obj = payload.get("call", {})
+    
+    customer_number = ""
+    if isinstance(call_obj, dict) and isinstance(call_obj.get("customer"), dict):
+        customer_number = call_obj["customer"].get("number", "")
+
     initial_state: PersonaState = {
         "raw_input": raw_input,
         "conversation_history": history,
         "mode": "voice",
+        "customer_number": customer_number,
     }
 
     state: PersonaState = await app.state.graph.ainvoke(initial_state)
