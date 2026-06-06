@@ -3,6 +3,7 @@ services:
     name: rag-persona-backend
     env: docker
     rootDir: backend
+    port: 8000
     plan: free
     healthCheckPath: /health
     autoDeploy: false
