@@ -39,17 +39,42 @@ def parse_vapi_request(payload: dict[str, Any]) -> tuple[str, list[dict[str, str
 
 async def format_vapi_response_stream(token_stream: AsyncIterator[str]) -> AsyncIterator[str]:
     """
-    Aggregates a stream of tokens into complete sentences.
-    Streams each sentence as an OpenAI-compatible SSE chunk.
-    Signals completion with data: [DONE].
+    Aggregates a stream of tokens.
+    Uses Fast-Start optimization: streams the first 4 words immediately to Vapi
+    so the assistant starts speaking instantly, then streams the rest sentence-by-sentence.
     """
     buffer = ""
     # Matches complete sentences, handling decimal points (e.g. 8.5) and abbreviations/domains (e.g. cal.com) without splitting
     sentence_end_regex = re.compile(r"^((?:[^.!?\n]|[.!?](?!\s))*?[.!?]+(?=\s))")
 
+    is_first_chunk = True
+    fast_start_word_count = 4
+
     async for token in token_stream:
         buffer += token
-        while True:
+
+        # Fast-start: yield the first few words immediately
+        if is_first_chunk:
+            space_indices = [i for i, char in enumerate(buffer) if char == ' ']
+            if len(space_indices) >= fast_start_word_count:
+                split_idx = space_indices[fast_start_word_count - 1]
+                first_part = buffer[:split_idx + 1]
+                buffer = buffer[split_idx + 1:]
+
+                chunk = {
+                    "choices": [
+                        {
+                            "delta": {
+                                "content": first_part
+                            }
+                        }
+                    ]
+                }
+                yield f"data: {json.dumps(chunk)}\n\n"
+                is_first_chunk = False
+
+        # Sentence-level streaming for the rest of the conversation
+        while not is_first_chunk:
             # Find the first complete sentence in the buffer
             match = sentence_end_regex.search(buffer)
             if not match:
@@ -87,4 +112,5 @@ async def format_vapi_response_stream(token_stream: AsyncIterator[str]) -> Async
 
     # Final OpenAI stream done signal
     yield "data: [DONE]\n\n"
+
 
