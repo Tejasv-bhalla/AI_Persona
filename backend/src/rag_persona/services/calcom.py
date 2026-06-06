@@ -9,6 +9,7 @@ from rag_persona.schemas import BookingRequest
 class CalComClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.client = httpx.AsyncClient(timeout=20)
 
     @property
     def configured(self) -> bool:
@@ -40,14 +41,13 @@ class CalComClient:
             "timeZone": "Asia/Kolkata",
         }
 
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.get(
-                "https://api.cal.com/v2/slots/available",
-                params=params,
-                headers=self._headers(),
-            )
-            response.raise_for_status()
-            return response.json()
+        response = await self.client.get(
+            "https://api.cal.com/v2/slots/available",
+            params=params,
+            headers=self._headers(),
+        )
+        response.raise_for_status()
+        return response.json()
 
     async def create_booking(self, request: BookingRequest) -> dict[str, object]:
         if not self.configured:
@@ -66,11 +66,10 @@ class CalComClient:
         if request.notes:
             payload["description"] = request.notes
 
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.post(
-                "https://api.cal.com/v2/bookings",
-                json=payload,
-                headers=self._headers(),
-            )
-            response.raise_for_status()
-            return response.json()
+        response = await self.client.post(
+            "https://api.cal.com/v2/bookings",
+            json=payload,
+            headers=self._headers(),
+        )
+        response.raise_for_status()
+        return response.json()

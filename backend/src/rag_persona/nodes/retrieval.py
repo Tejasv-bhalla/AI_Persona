@@ -35,16 +35,24 @@ async def retrieval_node(
     guard = state["guard"]
     mode = state.get("mode", "chat")
 
-    # Cache lookup for voice mode
-    if mode == "voice" and guard.keywords:
-        cached = get_cached_response(guard.keywords, ttl_seconds=settings.voice_cache_ttl_seconds)
-        if cached:
-            return {**state, "chunks": cached["chunks"]}
-
     raw_input = state.get("raw_input", "")
     repo_filter = extract_repo_filter(raw_input) or extract_repo_filter(guard.keywords)
 
     query_vector = embeddings.embed_one(guard.keywords)
+    state["query_vector"] = query_vector
+
+    # Cache lookup for voice mode
+    if mode == "voice" and guard.keywords:
+        cached = get_cached_response(
+            guard.keywords,
+            vector=query_vector,
+            ttl_seconds=settings.voice_cache_ttl_seconds,
+        )
+        if cached:
+            new_state = {**state, "chunks": cached["chunks"]}
+            if cached.get("answer"):
+                new_state["answer"] = cached["answer"]
+            return new_state
     
     # Restrict retrieval limit in voice mode
     limit = 5 if mode == "voice" else settings.max_retrieval_candidates
@@ -75,10 +83,6 @@ async def retrieval_node(
         )
     else:
         chunks = candidates[: settings.max_context_chunks]
-
-    # Populate cache for voice mode
-    if mode == "voice" and guard.keywords and chunks:
-        set_cached_response(guard.keywords, chunks)
 
     return {**state, "chunks": chunks}
 

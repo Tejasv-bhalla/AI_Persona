@@ -160,7 +160,29 @@ async def voice_endpoint(request: Request) -> StreamingResponse:
         groq=app.state.services.get("groq"),
     )
 
-    vapi_stream = format_vapi_response_stream(token_stream)
+    async def cache_accumulator() -> AsyncIterator[str]:
+        full_tokens = []
+        async for token in token_stream:
+            full_tokens.append(token)
+            yield token
+
+        # After streaming completes, cache the full response if it is a new generation
+        if "answer" not in state and state.get("mode") == "voice":
+            guard = state.get("guard")
+            keywords = guard.keywords if guard else None
+            chunks = state.get("chunks", [])
+            query_vector = state.get("query_vector")
+            full_answer = "".join(full_tokens)
+            if keywords and chunks and full_answer:
+                from rag_persona.voice.response_cache import set_cached_response
+                set_cached_response(
+                    key=keywords,
+                    chunks=chunks,
+                    answer=full_answer,
+                    vector=query_vector,
+                )
+
+    vapi_stream = format_vapi_response_stream(cache_accumulator())
 
     return StreamingResponse(
         vapi_stream,
