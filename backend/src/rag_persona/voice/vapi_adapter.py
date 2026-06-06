@@ -9,8 +9,11 @@ def parse_vapi_request(payload: dict[str, Any]) -> tuple[str, list[dict[str, str
     Parses Vapi's custom LLM request payload.
     Extracts the latest user message and conversation history.
     """
-    message_obj = payload.get("message", {})
-    messages = message_obj.get("messages", [])
+    if "messages" in payload:
+        messages = payload["messages"]
+    else:
+        message_obj = payload.get("message", {})
+        messages = message_obj.get("messages", [])
 
     current_input = ""
     history: list[dict[str, str]] = []

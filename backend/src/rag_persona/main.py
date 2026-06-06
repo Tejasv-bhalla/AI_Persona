@@ -137,6 +137,7 @@ async def book_slot(request: BookingRequest) -> dict[str, object]:
 
 
 @app.post("/voice")
+@app.post("/voice/chat/completions")
 async def voice_endpoint(request: Request) -> StreamingResponse:
     try:
         payload = await request.json()
