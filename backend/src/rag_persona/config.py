@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     groq_guard_model: str = "llama-3.1-8b-instant"
     groq_generation_model: str = "llama-3.3-70b-versatile"
     groq_grader_model: str = "llama-3.3-70b-versatile"
+    groq_voice_model: str = "llama-3.1-8b-instant"
 
     qdrant_url: HttpUrl | None = None
     qdrant_api_key: str = Field(default="", repr=False)

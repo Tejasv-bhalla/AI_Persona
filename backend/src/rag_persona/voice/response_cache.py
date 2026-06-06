@@ -34,7 +34,7 @@ def get_cached_response(
     key: str,
     vector: list[float] | None = None,
     ttl_seconds: int = 3600,
-    similarity_threshold: float = 0.95,
+    similarity_threshold: float = 0.88,
 ) -> dict[str, Any] | None:
     """
     Retrieve cached search results and answers using semantic matching if a vector is provided.

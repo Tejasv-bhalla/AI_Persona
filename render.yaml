@@ -32,3 +32,5 @@ services:
         value: llama-3.3-70b-versatile
       - key: GROQ_GRADER_MODEL
         value: llama-3.3-70b-versatile
+      - key: GROQ_VOICE_MODEL
+        value: llama-3.1-8b-instant

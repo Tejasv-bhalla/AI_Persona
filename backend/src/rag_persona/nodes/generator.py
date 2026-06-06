@@ -95,9 +95,10 @@ async def stream_generator_node(
     prompt = build_generation_prompt(state)
     mode = state.get("mode", "chat")
     system_prompt = VOICE_GENERATOR_SYSTEM_PROMPT if mode == "voice" else GENERATOR_SYSTEM_PROMPT
-    
+    model = settings.groq_voice_model if mode == "voice" else settings.groq_generation_model
+
     async for token in groq.stream_completion(
-        model=settings.groq_generation_model,
+        model=model,
         system=system_prompt,
         user=prompt,
         history=history,
