@@ -111,17 +111,19 @@ def detect_slot_selection(raw_input: str, slots: list[str]) -> str | None:
 
 def extract_email(text: str) -> str | None:
     """
-    Extracts email addresses from spoken transcription input.
+    Extracts email addresses from spoken transcription input, ensuring trailing punctuation is excluded.
     """
     import re
     # Clean text to handle common verbal formats of emails
     clean = text.lower().strip()
+    # Strip any trailing sentence punctuation first
+    clean = clean.rstrip(".?!,")
     clean = clean.replace("[at]", "@").replace("[dot]", ".").replace(" at ", "@").replace(" dot ", ".")
     
-    # A standard email regex search on the spaced string first, to isolate it from prefixes/suffixes
-    match = re.search(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", clean)
+    # A standard email regex search that forces the domain to end with an alphanumeric character
+    match = re.search(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-]*[a-zA-Z0-9]", clean)
     if match:
-        return match.group(0)
+        return match.group(0).rstrip(".")
     
     # If not matched (e.g. spaces inside the email itself like "john . doe @ gmail . com")
     # we remove all spaces and try again, but strip common prefix phrases first
@@ -132,11 +134,12 @@ def extract_email(text: str) -> str | None:
             temp = temp[len(prefix):].strip()
             
     spaced_clean = re.sub(r'\s+', '', temp)
-    match = re.search(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", spaced_clean)
+    match = re.search(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-]*[a-zA-Z0-9]", spaced_clean)
     if match:
-        return match.group(0)
+        return match.group(0).rstrip(".")
         
     return None
+
 
 
 
