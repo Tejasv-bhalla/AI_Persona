@@ -63,8 +63,8 @@ class CalComClient:
             },
             "metadata": {},
         }
-        if request.notes:
-            payload["description"] = request.notes
+        # Note: Cal.com v2 API does not allow 'description' at the root level
+        pass
 
         response = await self.client.post(
             "https://api.cal.com/v2/bookings",

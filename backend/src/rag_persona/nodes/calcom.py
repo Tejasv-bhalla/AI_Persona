@@ -243,7 +243,7 @@ async def calcom_node(
                                 preferred_time=selected_slot,
                                 attendee_name=name,
                                 attendee_email=email,
-                                notes="Booked via Portfolio Voice Agent."
+                                notes=None
                             )
                             await calcom.create_booking(req)
                             answer = f"Perfect! I've booked our meeting for {spoken_date} and sent the calendar invitation to {email}. You're all set! Is there anything else I can help you with?"
