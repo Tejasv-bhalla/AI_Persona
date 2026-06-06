@@ -18,23 +18,18 @@
 - [Architecture](#architecture)
 - [Feature Set](#feature-set)
 - [Technology Stack](#technology-stack)
+- [Cost Breakdown](#cost-breakdown)
 - [Repository Structure](#repository-structure)
 - [Prerequisites](#prerequisites)
 - [Environment Variables](#environment-variables)
 - [Local Setup](#local-setup)
-  - [1. Ingestion Pipeline](#1-ingestion-pipeline)
-  - [2. Backend](#2-backend)
-  - [3. Frontend](#3-frontend)
 - [Deployment](#deployment)
-  - [Backend — Render](#backend--render)
-  - [Frontend — Vercel / Netlify](#frontend--vercel--netlify)
 - [Voice Agent — Vapi Setup](#voice-agent--vapi-setup)
 - [API Reference](#api-reference)
 - [Graph Pipeline Deep Dive](#graph-pipeline-deep-dive)
 - [Voice Booking Flow](#voice-booking-flow)
 - [Performance Optimizations](#performance-optimizations)
 - [Known Limitations & Tradeoffs](#known-limitations--tradeoffs)
-- [Contributing](#contributing)
 - [License](#license)
 
 ---
@@ -54,43 +49,56 @@ Both channels share the same **LangGraph state machine** and **Qdrant retrieval 
 
 ## Architecture
 
+### System Diagram
+
+```mermaid
+flowchart TD
+    subgraph INGESTION["🗄️ Ingestion Pipeline (one-time)"]
+        GH["GitHub REST API\nresume.pdf / scope.md"]
+        CH["Chunker + FastEmbed\n(BGE-small, 384-dim)"]
+        QD[("Qdrant Cloud\nHybrid Index\n1,371 chunks")]
+        GH --> CH --> QD
+    end
+
+    subgraph GRAPH["⚙️ LangGraph State Machine"]
+        G["guard\nintent + safety\n(8B LLM)"]
+        R["router\ndeterministic routing"]
+        RET["retrieval\nBM25 + dense + cosine rerank"]
+        GEN["generator\nstreaming tokens\n(70B chat / 8B voice)"]
+        GRD["grader\nhallucination check\n(8B LLM, async)"]
+        CAL["calcom\nslot negotiation\n+ booking"]
+        ST["smalltalk\ncanned responses"]
+        G --> R
+        R --> RET --> GEN --> GRD
+        R --> CAL
+        R --> ST
+    end
+
+    QD -->|"hybrid search"| RET
+
+    subgraph CHAT["💬 Web Chat"]
+        FE["React + Vite\nFrontend"]
+        SSE1["/chat SSE\nFastAPI"]
+        FE <-->|"EventSource"| SSE1
+    end
+
+    subgraph VOICE["🎙️ Voice Agent"]
+        VAPI["Vapi Phone Agent\nDeepgram STT\nCartesia TTS"]
+        SSE2["/voice OpenAI SSE\nFastAPI"]
+        VAPI <-->|"OpenAI-compat stream"| SSE2
+    end
+
+    SSE1 --> GRAPH
+    SSE2 --> GRAPH
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         INGESTION PIPELINE                          │
-│  GitHub REST API → Chunker → FastEmbed (BGE-small) + BM25           │
-│  resume.pdf / contribution_scope.md → Qdrant Cloud (Hybrid Index)   │
-└────────────────────────────┬────────────────────────────────────────┘
-                             │  (one-time / on update)
-                             ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                       LANGGRAPH STATE MACHINE                       │
-│                                                                     │
-│  [guard] → [router] → [retrieval] → [generator] → [grader]         │
-│                    ↘ [calcom]                                       │
-│                    ↘ [smalltalk]                                    │
-│                                                                     │
-│  guard:      Intent classification + safety screening (8B LLM)      │
-│  router:     Deterministic routing + voice state recovery           │
-│  retrieval:  Hybrid BM25 + dense search, cosine reranking,          │
-│              semantic cache (voice only, cosine sim ≥ 0.88)         │
-│  calcom:     Cal.com availability + verbal slot negotiation +        │
-│              email capture + automated API booking                  │
-│  generator:  Streaming token generation (70B chat / 8B voice)       │
-│  grader:     Async hallucination detection (8B LLM judge)           │
-└────────────────────────────┬────────────────────────────────────────┘
-                             │
-          ┌──────────────────┴──────────────────┐
-          ▼                                     ▼
-   ┌─────────────┐                     ┌──────────────────┐
-   │  /chat SSE  │                     │  /voice OpenAI   │
-   │  (Web UI)   │                     │  SSE (Vapi)      │
-   └──────┬──────┘                     └────────┬─────────┘
-          │                                     │
-   ┌──────▼──────┐                     ┌────────▼─────────┐
-   │  React/Vite │                     │  Vapi Phone Agent│
-   │  Frontend   │                     │  (Deepgram STT + │
-   └─────────────┘                     │   Cartesia TTS)  │
-                                       └──────────────────┘
+
+### Request Flow (Text)
+
+```
+guard → router → retrieval → generator → (async grader)
+                ↘ calcom   (scheduling intent)
+                ↘ smalltalk (greeting / off-topic)
+                ↘ end_call  (voice termination)
 ```
 
 ---
@@ -110,7 +118,7 @@ Both channels share the same **LangGraph state machine** and **Qdrant retrieval 
 - **Fast-Start streaming**: The first 4 words are flushed immediately to Vapi, reducing perceived Time-to-First-Audio to ~850ms.
 - **Sentence-level streaming**: After the fast-start phrase, responses are streamed sentence-by-sentence to maintain natural TTS prosody.
 - **Semantic response cache**: In-process cosine similarity cache avoids redundant LLM calls for repeated questions within the same session (TTL: 1 hour, threshold: 0.88).
-- **Verbal email parsing**: Normalizes Deepgram transcriptions (`"john dot doe at gmail dot com."`) to clean email addresses, stripping trailing punctuation and spoken verbal cues.
+- **Verbal email parsing**: Normalizes Deepgram transcriptions (`"john dot doe at gmail dot com."`) to clean email addresses.
 - **Slot negotiation state machine**: The router recovers scheduling context statelessly from conversation history, ensuring the bot never loses track of which slot is being discussed.
 
 ---
@@ -159,6 +167,49 @@ Both channels share the same **LangGraph state machine** and **Qdrant retrieval 
 
 ---
 
+## Cost Breakdown
+
+> All costs reflect **free-tier usage** as deployed. Upgrade costs are noted where relevant.
+
+### Per Chat Session (≈ 5 turns)
+
+| Component | Free Tier Usage | Approx. Cost |
+|:---|:---|:---|
+| Groq `llama-3.3-70b-versatile` (generation) | ~2,000 tokens | **$0.00** (100K TPD free) |
+| Groq `llama-3.1-8b-instant` (guard + grader) | ~1,500 tokens | **$0.00** (free) |
+| Qdrant Cloud (vector search) | 5 hybrid queries | **$0.00** (free cluster) |
+| FastEmbed (local embedding) | 5 embeddings | **$0.00** (runs in-process) |
+| **Total per session** | | **~$0.00** |
+
+> At paid Groq rates (~$0.59/1M tokens for 70B), 5 turns ≈ **$0.001 per session**.
+
+### Per Voice Call (≈ 3 min booking call)
+
+| Component | Free Tier Usage | Approx. Cost |
+|:---|:---|:---|
+| Vapi platform fee | ~3 min call | **~$0.09** ($0.05/min + STT/TTS) |
+| Deepgram STT (via Vapi) | ~3 min audio | Included in Vapi |
+| Cartesia TTS (via Vapi) | ~500 words spoken | Included in Vapi |
+| Groq `llama-3.1-8b-instant` (voice generation) | ~3,000 tokens | **$0.00** (free tier) |
+| Cal.com booking API | 1 booking | **$0.00** (free plan) |
+| **Total per call** | | **~$0.05–$0.10** |
+
+### Monthly Infrastructure (Current Stack)
+
+| Service | Plan | Monthly Cost |
+|:---|:---|:---|
+| Render (backend) | Free | **$0.00** |
+| Qdrant Cloud | Free (1 node, 1GB) | **$0.00** |
+| Groq Cloud | Free | **$0.00** |
+| Vercel / Netlify (frontend) | Free | **$0.00** |
+| Vapi | Pay-per-minute | **~$0.05–0.10/call** |
+| Cal.com | Free | **$0.00** |
+| **Total** | | **$0.00 fixed + usage** |
+
+> **Note:** The only real cost is Vapi's per-minute charge for voice calls. Everything else runs free.
+
+---
+
 ## Repository Structure
 
 ```
@@ -182,7 +233,7 @@ Both channels share the same **LangGraph state machine** and **Qdrant retrieval 
 │       │   ├── grader.py        # LLM hallucination judge
 │       │   └── smalltalk.py     # Canned small-talk responses
 │       ├── services/
-│       │   ├── groq_client.py   # Groq async wrapper (stream + JSON)
+│       │   ├── groq_client.py   # Groq async wrapper (stream + JSON + 429 fallback)
 │       │   ├── qdrant_store.py  # Hybrid search, upsert, collection management
 │       │   ├── embeddings.py    # FastEmbed dense embedding service
 │       │   ├── calcom.py        # Cal.com v2 API client (slots + bookings)
@@ -202,6 +253,10 @@ Both channels share the same **LangGraph state machine** and **Qdrant retrieval 
 │   ├── pipeline.py              # CLI ingestion runner
 │   ├── .env.example
 │   └── data/                    # Place resume.pdf + contribution_scope_*.md here
+├── eval/
+│   ├── run_evals.py             # Ragas + custom judge evaluation runner
+│   └── golden_qa.json           # 10-question Golden Q&A test suite
+├── evals_report.md              # Final evaluation report
 ├── render.yaml                  # Render deployment manifest
 └── README.md
 ```
@@ -229,7 +284,7 @@ Both channels share the same **LangGraph state machine** and **Qdrant retrieval 
 | `QDRANT_COLLECTION` | ✅ | Collection name (default: `tejasv_knowledge_base`) |
 | `ALLOWED_ORIGINS` | ✅ | CORS allowed origins (comma-separated) |
 | `CALCOM_API_KEY` | ✅ | Cal.com live API key |
-| `CALCOM_EVENT_TYPE_ID` | ✅ | Cal.com event type ID (find in your Cal.com dashboard) |
+| `CALCOM_EVENT_TYPE_ID` | ✅ | Cal.com event type ID |
 | `CALCOM_USERNAME` | ✅ | Cal.com username slug |
 | `GROQ_GUARD_MODEL` | ❌ | Model for guard node (default: `llama-3.1-8b-instant`) |
 | `GROQ_GENERATION_MODEL` | ❌ | Model for chat generation (default: `llama-3.3-70b-versatile`) |
@@ -254,87 +309,73 @@ Both channels share the same **LangGraph state machine** and **Qdrant retrieval 
 
 | Variable | Required | Description |
 |:---|:---|:---|
-| `VITE_API_BASE_URL` | ✅ | Backend URL (`http://localhost:8000` locally, Render URL in production) |
+| `VITE_API_BASE_URL` | ✅ | Backend URL (`http://localhost:8000` locally, Render URL in prod) |
 
 ---
 
 ## Local Setup
 
-### 1. Ingestion Pipeline
+### 1. Clone & Configure
+
+```bash
+git clone https://github.com/<your-username>/AI_Persona.git
+cd AI_Persona
+```
+
+### 2. Ingestion Pipeline
 
 Place your personal knowledge files in `ingestion/data/`:
 
 ```
 ingestion/data/
-├── resume.pdf          # or resume.md / resume.txt
+├── resume.pdf
 ├── contribution_scope_<repo>.md   # for team/external projects
 ├── arch_decisions_<repo>.md       # optional
 └── dev_log_<repo>.md              # optional
 ```
 
-Create and configure the ingestion environment:
-
 ```bash
 cp ingestion/.env.example ingestion/.env
 # Fill in GITHUB_TOKEN, GITHUB_USERNAME, QDRANT_URL, QDRANT_API_KEY
-```
 
-Run the pipeline (fetches GitHub data, embeds everything, upserts to Qdrant):
-
-```bash
-# Your own repos only
+# Index your own repos only
 python ingestion/pipeline.py github
 
-# Including external / team repos
+# Or include external team repos
 python ingestion/pipeline.py github \
-  --external-repo https://github.com/org/team-project \
-  --external-repo https://github.com/org/another-repo
+  --external-repo https://github.com/org/team-project
 ```
 
-> **Note**: No local cloning is performed. All source files and commit history are fetched via the GitHub REST API.
+> **Note**: No local cloning is performed. All files and commit history are fetched via the GitHub REST API.
 
----
-
-### 2. Backend
+### 3. Backend
 
 ```bash
 cd backend
-cp .env.example .env
-# Fill in all required values
+cp .env.example .env          # fill in all required values
 
 python -m venv .venv
-source .venv/bin/activate            # Windows: .venv\Scripts\activate
+source .venv/bin/activate     # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 
 uvicorn rag_persona.main:app --reload --port 8000
 ```
 
-Verify the server is healthy:
-
+Verify:
 ```bash
 curl http://localhost:8000/health
 ```
 
-Test a voice request locally:
-
-```bash
-python test_local_voice.py "Tell me about Tejasv's education."
-```
-
----
-
-### 3. Frontend
+### 4. Frontend
 
 ```bash
 cd frontend
-cp .env.example .env
-# Set VITE_API_BASE_URL=http://localhost:8000
+cp .env.example .env          # set VITE_API_BASE_URL=http://localhost:8000
 
 npm install
 npm run dev
+# Open http://localhost:5173
 ```
-
-Open [http://localhost:5173](http://localhost:5173).
 
 ---
 
@@ -347,7 +388,7 @@ The project includes a `render.yaml` manifest for zero-config deployment.
 1. Push this repository to GitHub.
 2. Go to [render.com](https://render.com) → **New Web Service** → connect your GitHub repo.
 3. Render auto-detects `render.yaml` and configures the service.
-4. In your Render Dashboard → **Environment**, add all `sync: false` secrets manually:
+4. In your Render Dashboard → **Environment**, add all secrets manually:
    - `GROQ_API_KEY`
    - `QDRANT_URL`, `QDRANT_API_KEY`
    - `CALCOM_API_KEY`, `CALCOM_EVENT_TYPE_ID`, `CALCOM_USERNAME`
@@ -355,18 +396,15 @@ The project includes a `render.yaml` manifest for zero-config deployment.
    - `VAPI_WEBHOOK_SECRET` (optional)
 5. Click **Manual Deploy** → **Deploy latest commit**.
 
-> **Keep-Alive Tip**: Render's free tier sleeps after 15 minutes of inactivity. Set up a free monitor at [UptimeRobot](https://uptimerobot.com) or [cron-job.org](https://cron-job.org) pinging `https://<your-service>.onrender.com/health` every 10 minutes to prevent cold starts.
-
----
+> **Keep-Alive Tip**: Render's free tier sleeps after 15 minutes of inactivity. Set up a free monitor at [UptimeRobot](https://uptimerobot.com) pinging `https://<your-service>.onrender.com/health` every 10 minutes to prevent cold starts.
 
 ### Frontend — Vercel / Netlify
 
 ```bash
-cd frontend
-npm run build     # outputs to dist/
+cd frontend && npm run build   # outputs to dist/
 ```
 
-Deploy the `dist/` folder to Vercel or Netlify. Set the environment variable `VITE_API_BASE_URL` to your Render backend URL in the hosting dashboard.
+Deploy the `dist/` folder. Set `VITE_API_BASE_URL` to your Render backend URL in the hosting dashboard.
 
 ---
 
@@ -378,11 +416,10 @@ Deploy the `dist/` folder to Vercel or Netlify. Set the environment variable `VI
    ```
    https://<your-render-service>.onrender.com/voice
    ```
-4. Set the **System Prompt** to a brief persona description (optional — the backend handles grounding).
-5. Configure **Speech-to-Text**: Deepgram (recommended).
-6. Configure **Text-to-Speech**: Cartesia or ElevenLabs.
-7. Assign a **Phone Number** to the assistant.
-8. Copy the `Assistant ID` and add it to your backend's `VAPI_ASSISTANT_ID` env var.
+4. Configure **Speech-to-Text**: Deepgram (recommended).
+5. Configure **Text-to-Speech**: Cartesia or ElevenLabs.
+6. Assign a **Phone Number** to the assistant.
+7. Copy the `Assistant ID` and add it to your backend's `VAPI_ASSISTANT_ID` env var.
 
 The `/voice` endpoint is OpenAI-compatible — Vapi sends conversation history and the backend returns chunked SSE tokens.
 
@@ -435,7 +472,7 @@ OpenAI-compatible custom LLM endpoint for Vapi. Accepts Vapi's request payload f
 ---
 
 ### `POST /book`
-Direct calendar booking endpoint (for web chat scheduling).
+Direct calendar booking endpoint.
 
 **Request body:**
 ```json
@@ -456,15 +493,6 @@ Receives Vapi lifecycle events (`call-started`, `call-ended`, `transcript`). Val
 
 ## Graph Pipeline Deep Dive
 
-Every request — chat or voice — runs through the same LangGraph state machine:
-
-```
-guard → router → retrieval → generator → (async grader)
-                ↘ calcom
-                ↘ smalltalk
-                ↘ end_call (terminate)
-```
-
 ### Guard Node
 - Runs `llama-3.1-8b-instant` to classify intent (`rag`, `scheduling`, `small_talk`, `end_call`) and safety (`safe`, `suspicious`, `malicious`).
 - Distills raw user input into sanitized `keywords` used for retrieval.
@@ -473,30 +501,25 @@ guard → router → retrieval → generator → (async grader)
 
 ### Router Node
 - Deterministically routes based on guard output.
-- In voice mode, checks conversation history to force `scheduling` route if the bot is mid-negotiation (e.g., waiting for name, email, or slot confirmation) — preventing context loss from LLM intent misclassification.
+- In voice mode, checks conversation history to force `scheduling` route if the bot is mid-negotiation — preventing context loss from LLM intent misclassification.
 
 ### Retrieval Node
 - Generates a dense query vector via FastEmbed.
-- Checks the in-process semantic cache (voice only). On hit (cosine similarity ≥ 0.88), returns cached chunks and answer immediately.
+- Checks the in-process semantic cache (voice only). On hit (cosine similarity ≥ 0.88), returns immediately.
 - On miss: performs hybrid BM25 + dense Qdrant search, then reranks candidates by cosine similarity.
-- Stores the query vector in state for post-stream caching.
 
-### Cal.com Node (Scheduling)
+### Cal.com Node
 - Fetches up to 5 available slots from Cal.com API.
-- In voice mode, runs a 4-state conversation loop:
-  1. **Offer** — presents one slot at a time (`"My next slot is Monday at 10 AM. Does that work for you?"`)
-  2. **Negotiate** — if rejected, offers the next slot.
-  3. **Name capture** — asks for the recruiter's name.
-  4. **Email capture** — asks for email, normalizes verbal transcriptions, confirms, and books via Cal.com v2 API.
+- Runs a 4-state conversation loop: **Offer → Negotiate → Name capture → Email capture → Book**.
 
 ### Generator Node
 - Selects model based on mode: `llama-3.3-70b-versatile` for chat, `llama-3.1-8b-instant` for voice.
-- Streams tokens directly to the response. In voice mode, skips generation if `state["answer"]` is already set by the calcom or smalltalk node.
+- Streams tokens directly to the response.
 
 ### Grader Node (Chat Only)
 - Runs asynchronously after streaming completes.
-- Uses `llama-3.1-8b-instant` to verify every claim in the generated answer is supported by the retrieved context chunks.
-- Returns `grounded: bool` in the `done` SSE event. The frontend displays a visual indicator for ungrounded responses.
+- Uses `llama-3.1-8b-instant` to verify every claim is supported by retrieved context.
+- Returns `grounded: bool` in the `done` SSE event.
 
 ---
 
@@ -505,28 +528,25 @@ guard → router → retrieval → generator → (async grader)
 ```
 Recruiter: "Can I schedule a call?"
     ↓
-Bot: "My next available slot is Monday, June 9th at 10 AM. Does that work for you?"
+Bot: "My next available slot is Monday, June 9th at 10 AM. Does that work?"
     ↓
 Recruiter: "No, that doesn't work."
     ↓
-Bot: "No problem. How about Monday, June 9th at 10:30 AM?"
+Bot: "How about Monday, June 9th at 10:30 AM?"
     ↓
 Recruiter: "Yes, that works."
     ↓
-Bot: "Great! Can I get your name first?"
+Bot: "Great! Can I get your name?"
     ↓
-Recruiter: "My name is Sarah Connor."
+Recruiter: "Sarah Connor."
     ↓
-Bot: "Thanks, Sarah Connor. And what email address should I send the calendar invitation to?"
+Bot: "And what email should I send the calendar invite to?"
     ↓
 Recruiter: "sarah dot connor at skynet dot com."
+    ↓ [normalize → sarah.connor@skynet.com]
+Bot: "Perfect! Booked for Monday at 10:30 AM. Invite sent to sarah.connor@skynet.com."
     ↓
-[extract_email normalizes → "sarah.connor@skynet.com"]
-    ↓
-Bot: "Perfect! I've booked our meeting for Monday, June 9th at 10:30 AM and sent the
-      calendar invitation to sarah.connor@skynet.com. You're all set!"
-    ↓
-[Cal.com API creates booking, sends calendar invite to recruiter + host]
+[Cal.com API creates booking + sends calendar invite]
 ```
 
 ---
@@ -540,7 +560,6 @@ Bot: "Perfect! I've booked our meeting for Monday, June 9th at 10:30 AM and sent
 | Semantic response cache (cosine sim ≥ 0.88, TTL 1h) | Eliminates redundant LLM + DB calls for repeated voice queries |
 | Persistent `httpx.AsyncClient` in CalComClient | Avoids TCP handshake overhead on every calendar call |
 | Grader model: 8B instead of 70B | 4× fewer tokens, stays within Groq free-tier daily limits |
-| Metadata stripping in grader context | Reduces grader prompt size by 30–40% |
 | Source-filtered Qdrant search | Narrows candidate pool, improves precision |
 | BM25 + dense hybrid search with cosine reranking | Better retrieval accuracy vs pure dense-only search |
 
@@ -549,24 +568,14 @@ Bot: "Perfect! I've booked our meeting for Monday, June 9th at 10:30 AM and sent
 ## Known Limitations & Tradeoffs
 
 ### Free Tier Constraints
-- **Groq free tier**: 100K tokens/day on `llama-3.3-70b-versatile`. Heavy usage exhausts the daily limit. Upgrading to Dev tier or using `llama-3.1-8b-instant` for chat removes this constraint.
-- **Render free tier**: Service sleeps after 15 minutes of inactivity. Configure a keep-alive monitor to prevent cold starts.
+- **Groq free tier**: 100K tokens/day on `llama-3.3-70b-versatile`. Heavy usage exhausts the daily limit.
+- **Render free tier**: Service sleeps after 15 minutes of inactivity. Use a keep-alive monitor.
 
 ### Tradeoffs Made
-- **Grader accuracy vs. cost**: Downgraded grader from 70B to 8B to stay within Groq free-tier limits. Binary `grounded/ungrounded` classification showed no meaningful quality difference in testing.
-- **Verbal email collection vs. SMS**: Removed Twilio SMS delivery in favor of asking for email verbally on the call. This eliminates external SMS costs and Twilio trial restrictions entirely.
-- **In-process cache vs. Redis**: Voice semantic cache is stored in-process (Python dict). This is simpler and zero-cost, but does not persist across server restarts and is not shared across multiple instances.
-
----
-
-## Contributing
-
-1. Fork the repository.
-2. Create a feature branch: `git checkout -b feat/your-feature`
-3. Make your changes. Run the linter: `cd backend && .venv/bin/ruff check src/`
-4. Commit: `git commit -m "feat: your feature description"`
-5. Push: `git push origin feat/your-feature`
-6. Open a Pull Request.
+- **FlashRank reranker removed**: FlashRank's ONNX model (150–220MB) exceeded Render's 512MB RAM ceiling. Replaced with lightweight NumPy cosine similarity — trading ~3–7% precision for 100% uptime.
+- **Grader accuracy vs. cost**: Downgraded grader from 70B to 8B to stay within free-tier limits. No meaningful quality difference in testing.
+- **Vapi over direct Twilio**: Vapi's managed telephony reduced integration time significantly. A direct Twilio WebSockets pipeline would give more control over barge-in sensitivity and SIP routing, but was out of scope for the timeline.
+- **In-process cache vs. Redis**: Voice semantic cache is stored in-process (Python dict). Zero cost, but doesn't persist across restarts or scale horizontally.
 
 ---
 
