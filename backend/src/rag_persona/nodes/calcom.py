@@ -109,24 +109,46 @@ def detect_slot_selection(raw_input: str, slots: list[str]) -> str | None:
     return None
 
 
+def normalize_spoken_time(text: str) -> str:
+    """
+    Normalizes time text (converting word numbers/ordinals to digits) to allow robust comparisons.
+    """
+    mapping = {
+        "first": "1st", "second": "2nd", "third": "3rd", "fourth": "4th", "fifth": "5th",
+        "one": "1", "two": "2", "three": "3", "four": "4", "five": "5", "six": "6",
+        "seven": "7", "eight": "8", "eighth": "8th", "nine": "9", "ten": "10",
+        "eleven": "11", "twelve": "12", "thirty": "30", "am": "am", "pm": "pm"
+    }
+    import re
+    cleaned = text.lower()
+    cleaned = re.sub(r'[^a-z0-9]', ' ', cleaned)
+    tokens = cleaned.split()
+    normalized_tokens = [mapping.get(t, t) for t in tokens]
+    return " ".join(normalized_tokens)
+
+
 def extract_email(text: str) -> str | None:
     """
     Extracts email addresses from spoken transcription input, ensuring trailing punctuation is excluded.
     """
     import re
-    # Clean text to handle common verbal formats of emails
     clean = text.lower().strip()
-    # Strip any trailing sentence punctuation first
     clean = clean.rstrip(".?!,")
+    
+    # Handle verbal and phonetic mis-transcriptions (e.g. "at the rate" -> "@", "third egg mail" -> "gmail")
+    clean = clean.replace("at the rate of", "@").replace("at the rate", "@").replace("third egg mail", "gmail")
     clean = clean.replace("[at]", "@").replace("[dot]", ".").replace(" at ", "@").replace(" dot ", ".")
+    
+    # Strip spaces around @ and .
+    clean = re.sub(r'\s*@\s*', '@', clean)
+    clean = re.sub(r'\s*\.\s*', '.', clean)
     
     # A standard email regex search that forces the domain to end with an alphanumeric character
     match = re.search(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-]*[a-zA-Z0-9]", clean)
     if match:
         return match.group(0).rstrip(".")
     
-    # If not matched (e.g. spaces inside the email itself like "john . doe @ gmail . com")
-    # we remove all spaces and try again, but strip common prefix phrases first
+    # If not matched, remove all spaces and try again
     prefixes = ["my email is", "email is", "send to", "address is", "email to", "email address is"]
     temp = clean
     for prefix in prefixes:
@@ -190,16 +212,12 @@ async def calcom_node(
         if mode == "voice":
             history = state.get("conversation_history", [])
             
-            # Determine conversational state from history
-            last_assistant_msg = ""
-            for msg in reversed(history):
-                if msg.get("role") == "assistant":
-                    last_assistant_msg = msg.get("content", "")
-                    break
-
-            # Helper to extract name
+            # Helper to extract name with filler word stripping
             def extract_name(text: str) -> str:
+                import re
                 clean = text.strip()
+                # Strip conversational filler words and leading punctuation
+                clean = re.sub(r'^(yeah|yes|sure|okay|hi|hello|hey|uhm|uh|ah|great)\b[\s.,!?]*', '', clean, flags=re.IGNORECASE).strip()
                 prefixes = ["my name is", "this is", "i am", "sure, my name is", "sure, this is", "it is", "its"]
                 lowered = clean.lower()
                 for prefix in prefixes:
@@ -207,6 +225,13 @@ async def calcom_node(
                         clean = clean[len(prefix):].strip()
                         break
                 return clean.title()
+
+            # Determine conversational state from history
+            last_assistant_msg = ""
+            for msg in reversed(history):
+                if msg.get("role") == "assistant":
+                    last_assistant_msg = msg.get("content", "")
+                    break
 
             # State A: Expecting email
             if last_assistant_msg and ("email address" in last_assistant_msg.lower() or "what email" in last_assistant_msg.lower() or "send the invitation to" in last_assistant_msg.lower() or "send the invite to" in last_assistant_msg.lower()):
@@ -221,12 +246,14 @@ async def calcom_node(
                                 name = extract_name(history[idx + 1].get("content", ""))
                                 break
 
-                    # Find selected slot from history
+                    # Find selected slot from history using normalized spoken time comparison
                     selected_slot = None
                     for msg in reversed(history):
                         if msg.get("role") == "assistant" and ("does that work for you" in msg.get("content", "").lower() or "how about" in msg.get("content", "").lower()):
+                            norm_msg = normalize_spoken_time(msg.get("content", ""))
                             for s in slots:
-                                if to_spoken_slot(s).lower() in msg.get("content", "").lower():
+                                norm_slot = normalize_spoken_time(to_spoken_slot(s))
+                                if norm_slot in norm_msg:
                                     selected_slot = s
                                     break
                             if selected_slot:
@@ -288,8 +315,10 @@ async def calcom_node(
                 user_rejected = any(neg in raw_input.lower() for neg in negatives)
 
                 last_offered_idx = -1
+                norm_last_msg = normalize_spoken_time(last_assistant_msg)
                 for s_idx, s in enumerate(slots):
-                    if to_spoken_slot(s).lower() in last_assistant_msg.lower():
+                    norm_slot = normalize_spoken_time(to_spoken_slot(s))
+                    if norm_slot in norm_last_msg:
                         last_offered_idx = s_idx
                         break
 
