@@ -86,40 +86,46 @@ async def warm() -> dict[str, str]:
 @app.post("/chat")
 async def chat(request: ChatRequest) -> StreamingResponse:
     async def events() -> AsyncIterator[str]:
-        initial_state: PersonaState = {
-            "raw_input": request.message,
-            "session_id": request.session_id,
-            "conversation_history": request.conversation_history,
-        }
-        state: PersonaState = await app.state.graph.ainvoke(initial_state)
-        yield sse(ChatEvent(type="meta", data=json.dumps({"route": state.get("route", "rag")})))
+        try:
+            initial_state: PersonaState = {
+                "raw_input": request.message,
+                "session_id": request.session_id,
+                "conversation_history": request.conversation_history,
+            }
+            state: PersonaState = await app.state.graph.ainvoke(initial_state)
+            yield sse(ChatEvent(type="meta", data=json.dumps({"route": state.get("route", "rag")})))
 
-        answer_parts: list[str] = []
-        async for token in stream_generator_node(
-            state=state,
-            settings=app.state.settings,
-            groq=app.state.services.get("groq"),
-        ):
-            answer_parts.append(token)
-            yield sse(ChatEvent(type="token", data=token))
+            answer_parts: list[str] = []
+            async for token in stream_generator_node(
+                state=state,
+                settings=app.state.settings,
+                groq=app.state.services.get("groq"),
+            ):
+                answer_parts.append(token)
+                yield sse(ChatEvent(type="token", data=token))
 
-        answer = "".join(answer_parts)
-        grounded = await grade_answer(
-            state=state,
-            answer=answer,
-            settings=app.state.settings,
-            groq=app.state.services.get("groq"),
-        )
-
-        yield sse(
-            ChatEvent(
-                type="done",
-                data="",
-                session_id=request.session_id or state.get("session_id"),
-                grounded=grounded,
-                available_slots=state.get("available_slots"),
+            answer = "".join(answer_parts)
+            grounded = await grade_answer(
+                state=state,
+                answer=answer,
+                settings=app.state.settings,
+                groq=app.state.services.get("groq"),
             )
-        )
+
+            yield sse(
+                ChatEvent(
+                    type="done",
+                    data="",
+                    session_id=request.session_id or state.get("session_id"),
+                    grounded=grounded,
+                    available_slots=state.get("available_slots"),
+                )
+            )
+        except Exception as e:
+            error_msg = "The Groq API free-tier limit was reached. Please try again in a few minutes."
+            if "rate_limit" not in str(e).lower() and "429" not in str(e):
+                error_msg = f"An unexpected error occurred: {str(e)}"
+            yield sse(ChatEvent(type="error", data=error_msg))
 
     return StreamingResponse(events(), media_type="text/event-stream")
 

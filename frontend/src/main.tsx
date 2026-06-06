@@ -316,6 +316,14 @@ function App() {
                   : message
               )
             );
+          } else if (parsed.type === "error") {
+            setMessages((current) =>
+              current.map((message) =>
+                message.id === assistantId
+                  ? { ...message, content: parsed.data }
+                  : message
+              )
+            );
           }
         }
       }
@@ -326,7 +334,7 @@ function App() {
             ? {
                 ...message,
                 content:
-                  "I hit a backend hiccup. Check the API URL, environment variables, and server logs.",
+                  "Could not connect to the server. The backend may be booting up or temporarily offline. Please try again in a moment.",
               }
             : message
         )
