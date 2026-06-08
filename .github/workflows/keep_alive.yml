@@ -4,6 +4,9 @@ on:
   schedule:
     - cron: '*/10 * * * *'  # every 10 minutes
   workflow_dispatch:          # allow manual trigger from GitHub UI
+  push:
+    branches:
+      - main
 
 jobs:
   ping:
