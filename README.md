@@ -9,6 +9,9 @@
 [![Groq](https://img.shields.io/badge/Groq-LPU-yellow)](https://groq.com)
 [![Vapi](https://img.shields.io/badge/Vapi-Voice-red)](https://vapi.ai)
 [![Render](https://img.shields.io/badge/Deploy-Render-46E3B7?logo=render)](https://render.com)
+[![Keep Render Alive](https://github.com/Tejasv-bhalla/AI_Persona/actions/workflows/keep_alive.yml/badge.svg)](https://github.com/Tejasv-bhalla/AI_Persona/actions/workflows/keep_alive.yml)
+
+![AI Persona Chat UI](docs/Screenshot.png)
 
 ---
 
