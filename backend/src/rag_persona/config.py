@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     app_env: str = "local"
     allowed_origins: str = "http://localhost:5173"
     dry_run: bool = False
-    repo_blocklist: list[str] = ["ai_person", "AI_Persona", "ai-persona"]
+    repo_blocklist: list[str] = []
 
 
     groq_api_key: str = Field(default="", repr=False)
@@ -42,9 +42,6 @@ class Settings(BaseSettings):
     vapi_webhook_secret: str = Field(default="", repr=False)
     voice_max_response_words: int = 80
     voice_cache_ttl_seconds: int = 3600
-    twilio_sid: str = ""
-    twilio_token: str = Field(default="", repr=False)
-    twilio_from: str = ""
 
     @property
     def cors_origins(self) -> list[str]:

@@ -44,7 +44,7 @@ This project implements an AI-powered portfolio persona that operates across **t
 | Channel | Interface | Description |
 |:---|:---|:---|
 | **Web Chat** | Browser (React + Vite) | Streaming RAG chat grounded in personal knowledge base |
-| **Voice Call** | Phone (via Vapi + Twilio) | Full conversational phone agent with real-time calendar booking |
+| **Voice Call** | Phone (via Vapi) | Full conversational phone agent with real-time calendar booking |
 
 Both channels share the same **LangGraph state machine** and **Qdrant retrieval backend**, ensuring consistent, hallucination-grounded responses across all surfaces.
 
@@ -239,9 +239,7 @@ guard → router → retrieval → generator → (async grader)
 │       │   ├── groq_client.py   # Groq async wrapper (stream + JSON + 429 fallback)
 │       │   ├── qdrant_store.py  # Hybrid search, upsert, collection management
 │       │   ├── embeddings.py    # FastEmbed dense embedding service
-│       │   ├── calcom.py        # Cal.com v2 API client (slots + bookings)
-│       │   ├── reranker.py      # Cosine reranker over candidate chunks
-│       │   └── sms.py           # Twilio SMS helper (httpx, no SDK)
+│       │   └── calcom.py        # Cal.com v2 API client (slots + bookings)
 │       ├── voice/
 │       │   ├── vapi_adapter.py  # Parse Vapi payload + format OpenAI SSE stream
 │       │   └── response_cache.py # In-process semantic cache (vector + TTL)
@@ -399,7 +397,7 @@ The project includes a `render.yaml` manifest for zero-config deployment.
    - `VAPI_WEBHOOK_SECRET` (optional)
 5. Click **Manual Deploy** → **Deploy latest commit**.
 
-> **Keep-Alive Tip**: Render's free tier sleeps after 15 minutes of inactivity. Set up a free monitor at [UptimeRobot](https://uptimerobot.com) pinging `https://<your-service>.onrender.com/health` every 10 minutes to prevent cold starts.
+> **Keep-Alive Tip**: Render's free tier sleeps after 15 minutes of inactivity. This repo includes a GitHub Actions workflow (`.github/workflows/keep_alive.yml`) that pings the `/health` endpoint on every push. For reliable scheduled pings, set up a free monitor at [cron-job.org](https://cron-job.org) to hit `https://<your-service>.onrender.com/health` every 10 minutes.
 
 ### Frontend — Vercel / Netlify
 
