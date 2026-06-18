@@ -16,6 +16,8 @@ def extract_repo_filter(text: str) -> str | None:
         "Stock-Market-Prediction": ["stock-market-prediction", "stock market", "stock-market"],
         "TalentScoutBot": ["talentscoutbot", "talentscout", "talent scout"],
         "Shramik.ai": ["shramik.ai", "shramik", "shramik-ai"],
+        "AI_Persona": ["ai_persona", "ai-persona", "ai persona"],
+        "LegalX": ["legalx", "legal x"],
     }
     for repo_name, aliases in repos.items():
         if any(alias in lowered for alias in aliases):
@@ -37,6 +39,12 @@ async def retrieval_node(
 
     raw_input = state.get("raw_input", "")
     repo_filter = extract_repo_filter(raw_input) or extract_repo_filter(guard.keywords)
+    if not repo_filter and state.get("conversation_history"):
+        for turn in reversed(state["conversation_history"]):
+            content = turn.get("content", "")
+            repo_filter = extract_repo_filter(content)
+            if repo_filter:
+                break
 
     # Offload CPU-bound ONNX embedding inference to a thread pool to avoid blocking the event loop
     query_vector = await asyncio.to_thread(embeddings.embed_one, guard.keywords)

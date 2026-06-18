@@ -295,8 +295,8 @@ def chunk_changelog(path: Path, text: str, repo_name: str, is_external_repo: boo
 
 
 def chunk_resume(path: Path, text: str, repo_name: str, is_external_repo: bool) -> list[Chunk]:
-    headings = "Education|Experience|Projects|Skills|Certifications|Achievements"
-    sections = re.split(rf"(?im)^\s*({headings})\s*$", text)
+    headings = "Education|Experience|Projects|Technical Skills|Skills|Certifications|Achievements|Why I'm the Right Fit.*|Additional Notes.*"
+    sections = re.split(rf"(?im)^\s*#{{0,4}}\s*({headings})\s*$", text)
     if len(sections) == 1:
         return chunk_by_paragraphs(path, text, repo_name, SourceType.resume, is_external_repo)
 
