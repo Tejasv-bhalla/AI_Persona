@@ -34,9 +34,3 @@ services:
         value: llama-3.1-8b-instant
       - key: GROQ_VOICE_MODEL
         value: llama-3.1-8b-instant
-      - key: TWILIO_SID
-        sync: false
-      - key: TWILIO_TOKEN
-        sync: false
-      - key: TWILIO_FROM
-        sync: false
