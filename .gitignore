@@ -20,3 +20,7 @@ build/
 # Local manual knowledge data (contains resume and contribution scope)
 ingestion/data/
 
+
+# Build artifacts
+*.egg-info/
+.gstack/
