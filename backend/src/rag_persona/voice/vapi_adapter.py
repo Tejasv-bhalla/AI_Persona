@@ -44,7 +44,7 @@ async def format_vapi_response_stream(token_stream: AsyncIterator[str]) -> Async
     so the assistant starts speaking instantly, then streams the rest sentence-by-sentence.
     """
     buffer = ""
-    # Matches complete sentences, handling decimal points (e.g. 8.5) and abbreviations/domains (e.g. cal.com) without splitting
+    # Matches complete sentences without splitting on decimals (8.5) or domains (cal.com).
     sentence_end_regex = re.compile(r"^((?:[^.!?\n]|[.!?](?!\s))*?[.!?]+(?=\s))")
 
     is_first_chunk = True
