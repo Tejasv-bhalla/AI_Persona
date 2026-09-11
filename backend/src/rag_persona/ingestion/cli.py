@@ -1,35 +1,22 @@
 import argparse
 import asyncio
+from collections.abc import Iterator
 from pathlib import Path
 
 from rag_persona.config import get_settings
 from rag_persona.ingestion.bm25 import BM25Encoder
 from rag_persona.ingestion.chunkers import chunk_file
-from rag_persona.ingestion.github_pipeline import build_github_knowledge_base
+from rag_persona.ingestion.github_pipeline import (
+    ALLOWED_SUFFIXES,
+    IGNORED_DIRS,
+    build_github_knowledge_base,
+)
 from rag_persona.ingestion.gitlog import write_changelog
 from rag_persona.services.embeddings import EmbeddingService
 from rag_persona.services.qdrant_store import QdrantStore
 
-IGNORED_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", "dist", "build"}
-ALLOWED_SUFFIXES = {
-    ".md",
-    ".txt",
-    ".pdf",
-    ".py",
-    ".js",
-    ".jsx",
-    ".ts",
-    ".tsx",
-    ".go",
-    ".java",
-    ".cpp",
-    ".c",
-    ".h",
-    ".ipynb",
-}
 
-
-def iter_source_files(source: Path):
+def iter_source_files(source: Path) -> Iterator[Path]:
     for path in source.rglob("*"):
         if any(part in IGNORED_DIRS for part in path.parts):
             continue
@@ -51,7 +38,7 @@ def ingest(source: Path, repo_name: str, reset: bool) -> None:
     for path in iter_source_files(source):
         chunks.extend(chunk_file(path, repo_name=repo_name))
 
-    payloads = [
+    payloads: list[dict[str, object]] = [
         {
             "chunk_id": chunk.chunk_id,
             "chunk_text": chunk.text,
@@ -93,17 +80,17 @@ def main() -> None:
     github_parser.add_argument("--resume", type=Path)
     github_parser.add_argument("--data-dir", type=Path, default=Path("ingestion/data"))
     github_parser.add_argument("--no-reset", action="store_true")
-    github_parser.add_argument("--dry-run", action="store_true", help="Run the pipeline without upserting to Qdrant")
-    github_parser.add_argument("--incremental", action="store_true", help="Only upsert new chunks, skip existing ones")
-    github_parser.add_argument("--concurrent-repos", type=int, default=2, help="Limit concurrent repo fetches")
-    github_parser.add_argument("--snapshot-name", type=str, default=None, help="Optional snapshot name before reset")
+    github_parser.add_argument(
+        "--dry-run", action="store_true", help="Run the pipeline without upserting to Qdrant"
+    )
 
     args = parser.parse_args()
     if args.command == "ingest":
         # Protect against accidental indexing of repository root
         if args.source == Path(".") and not getattr(args, "confirm_local", False):
             raise SystemExit(
-                "Refusing to ingest from '.' (repository root). If you really mean to index local files, re-run with --confirm-local."
+                "Refusing to ingest from '.' (repository root). If you really mean to "
+                "index local files, re-run with --confirm-local."
             )
         ingest(source=args.source, repo_name=args.repo_name, reset=args.reset)
     elif args.command == "changelog":
@@ -123,9 +110,6 @@ def main() -> None:
                 reset=not args.no_reset,
                 resume_path=args.resume,
                 data_dir=args.data_dir,
-                incremental=bool(args.incremental),
-                concurrent_repos=int(args.concurrent_repos),
-                snapshot_name=args.snapshot_name,
             )
         )
         print(f"Indexed {report.chunks_indexed} chunks in {report.elapsed_seconds}s")
