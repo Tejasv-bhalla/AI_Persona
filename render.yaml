@@ -27,10 +27,32 @@ services:
       - key: CALCOM_USERNAME
         sync: false
       - key: GROQ_GUARD_MODEL
-        value: llama-3.1-8b-instant
+        value: qwen/qwen3.8-27b
       - key: GROQ_GENERATION_MODEL
-        value: llama-3.3-70b-versatile
+        value: qwen/qwen3.8-27b
       - key: GROQ_GRADER_MODEL
-        value: llama-3.1-8b-instant
+        value: qwen/qwen3.8-27b
       - key: GROQ_VOICE_MODEL
-        value: llama-3.1-8b-instant
+        value: qwen/qwen3.8-27b
+      - key: GROQ_FALLBACK_MODEL
+        value: openai/gpt-oss-20b
+      # Required: without it /voice accepts unauthenticated LLM calls.
+      - key: VAPI_WEBHOOK_SECRET
+        sync: false
+      # Leave unset to keep /chat/eval disabled (404) in production.
+      - key: EVAL_API_KEY
+        sync: false
+      - key: RATE_LIMIT_CHAT
+        value: 20/minute
+      - key: RATE_LIMIT_VOICE
+        value: 60/minute
+      - key: RATE_LIMIT_BOOK
+        value: 5/hour
+      # Groq free tier: 1000 output tokens/min, admitted against max_tokens.
+      # guard + generation + grader must sum below that ceiling.
+      - key: MAX_OUTPUT_TOKENS_JSON
+        value: 200
+      - key: MAX_OUTPUT_TOKENS_CHAT
+        value: 500
+      - key: MAX_OUTPUT_TOKENS_VOICE
+        value: 300
