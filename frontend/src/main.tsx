@@ -1,5 +1,6 @@
-import React, { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import ReactMarkdown, { Components } from "react-markdown";
 import "./styles.css";
 
 type Role = "user" | "assistant";
@@ -9,16 +10,21 @@ type Message = {
   role: Role;
   content: string;
   grounded?: boolean;
+  /** True once the backend streamed a regenerated answer over the original one. */
+  corrected?: boolean;
   available_slots?: string[];
 };
 
 type ChatEvent = {
-  type: "token" | "done" | "error" | "meta";
+  type: "token" | "correction" | "done" | "error" | "meta";
   data: string;
   session_id?: string;
   grounded?: boolean;
   available_slots?: string[];
 };
+
+/** The backend only consumes the last 6 turns; cap the payload so it stays bounded. */
+const MAX_HISTORY_TURNS = 10;
 
 const rawApiUrl = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
 const apiBaseUrl = rawApiUrl.endsWith("/") ? rawApiUrl.slice(0, -1) : rawApiUrl;
@@ -27,97 +33,16 @@ function makeId(): string {
   return crypto.randomUUID();
 }
 
-function parseInlineMarkdown(text: string): React.ReactNode[] {
-  const boldParts = text.split(/\*\*([\s\S]*?)\*\*/g);
-  const elements: React.ReactNode[] = [];
+const markdownComponents: Components = {
+  pre: ({ children }) => <pre className="code-block">{children}</pre>,
+};
 
-  boldParts.forEach((part, boldIndex) => {
-    const isBold = boldIndex % 2 === 1;
-    const codeParts = part.split(/`([^`]+)`/g);
-    codeParts.forEach((codePart, codeIndex) => {
-      const isCode = codeIndex % 2 === 1;
-      let node: React.ReactNode = codePart;
-
-      if (isCode) {
-        node = <code key={`${boldIndex}-${codeIndex}`}>{codePart}</code>;
-      }
-      if (isBold) {
-        node = <strong key={`${boldIndex}-${codeIndex}-bold`}>{node}</strong>;
-      }
-      elements.push(node);
-    });
-  });
-
-  return elements;
-}
-
-function renderMarkdown(text: string): React.ReactNode {
-  if (!text) return null;
-  const lines = text.split("\n");
-  let inCodeBlock = false;
-  let codeBlockLines: string[] = [];
-  const elements: React.ReactNode[] = [];
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-
-    if (line.startsWith("```")) {
-      if (inCodeBlock) {
-        elements.push(
-          <pre key={`code-${i}`} className="code-block">
-            <code>{codeBlockLines.join("\n")}</code>
-          </pre>
-        );
-        codeBlockLines = [];
-        inCodeBlock = false;
-      } else {
-        inCodeBlock = true;
-      }
-      continue;
-    }
-
-    if (inCodeBlock) {
-      codeBlockLines.push(line);
-      continue;
-    }
-
-    if (line.startsWith("- ") || line.startsWith("* ")) {
-      const content = line.substring(2);
-      elements.push(<li key={`li-${i}`}>{parseInlineMarkdown(content)}</li>);
-      continue;
-    }
-
-    if (/^\d+\.\s+/.test(line)) {
-      const content = line.replace(/^\d+\.\s+/, "");
-      elements.push(
-        <li key={`li-num-${i}`} style={{ listStyleType: "decimal", marginLeft: "1.5rem" }}>
-          {parseInlineMarkdown(content)}
-        </li>
-      );
-      continue;
-    }
-
-    if (line.startsWith("### ")) {
-      elements.push(<h3 key={`h3-${i}`}>{parseInlineMarkdown(line.substring(4))}</h3>);
-      continue;
-    }
-    if (line.startsWith("## ")) {
-      elements.push(<h2 key={`h2-${i}`}>{parseInlineMarkdown(line.substring(3))}</h2>);
-      continue;
-    }
-    if (line.startsWith("# ")) {
-      elements.push(<h1 key={`h1-${i}`}>{parseInlineMarkdown(line.substring(2))}</h1>);
-      continue;
-    }
-
-    if (line.trim()) {
-      elements.push(<p key={`p-${i}`}>{parseInlineMarkdown(line)}</p>);
-    } else {
-      elements.push(<div key={`br-${i}`} className="paragraph-spacer" />);
-    }
-  }
-
-  return <div className="markdown-body">{elements}</div>;
+function Markdown({ content }: { content: string }) {
+  return (
+    <div className="markdown-body">
+      <ReactMarkdown components={markdownComponents}>{content}</ReactMarkdown>
+    </div>
+  );
 }
 
 function BookingForm({ slotTime, onClose }: { slotTime: string; onClose: () => void }) {
@@ -239,6 +164,7 @@ function App() {
   );
   const sessionId = useMemo(makeId, []);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     fetch(`${apiBaseUrl}/warm`).catch(() => undefined);
@@ -256,7 +182,12 @@ function App() {
     const assistantId = makeId();
     const history = messages
       .filter((m) => m.content && m.content !== "Thinking…")
+      .slice(-MAX_HISTORY_TURNS)
       .map((m) => ({ role: m.role, content: m.content }));
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+    let correctionStarted = false;
 
     setInput("");
     setIsStreaming(true);
@@ -275,6 +206,7 @@ function App() {
           session_id: sessionId,
           conversation_history: history,
         }),
+        signal: controller.signal,
       });
 
       if (!response.ok || !response.body) {
@@ -304,6 +236,22 @@ function App() {
                   : message
               )
             );
+          } else if (parsed.type === "correction") {
+            // The first correction token means grounding failed and a regenerated
+            // answer is now streaming: drop what we have and start over.
+            const isFirstCorrectionToken = !correctionStarted;
+            correctionStarted = true;
+            setMessages((current) =>
+              current.map((message) =>
+                message.id === assistantId
+                  ? {
+                      ...message,
+                      content: (isFirstCorrectionToken ? "" : message.content) + parsed.data,
+                      corrected: true,
+                    }
+                  : message
+              )
+            );
           } else if (parsed.type === "done") {
             setMessages((current) =>
               current.map((message) =>
@@ -328,20 +276,28 @@ function App() {
         }
       }
     } catch {
-      setMessages((current) =>
-        current.map((message) =>
-          message.id === assistantId
-            ? {
-                ...message,
-                content:
-                  "Could not connect to the server. The backend may be booting up or temporarily offline. Please try again in a moment.",
-              }
-            : message
-        )
-      );
+      // An intentional stop is not an error: keep the partial answer on screen.
+      if (!controller.signal.aborted) {
+        setMessages((current) =>
+          current.map((message) =>
+            message.id === assistantId
+              ? {
+                  ...message,
+                  content:
+                    "Could not connect to the server. The backend may be booting up or temporarily offline. Please try again in a moment.",
+                }
+              : message
+          )
+        );
+      }
     } finally {
+      abortRef.current = null;
       setIsStreaming(false);
     }
+  }
+
+  function stop() {
+    abortRef.current?.abort();
   }
 
   return (
@@ -361,13 +317,18 @@ function App() {
             <article className={`message ${message.role}`} key={message.id}>
               <div className="message-header">
                 <span>{message.role === "user" ? "You" : "Persona"}</span>
-                {message.grounded === false && (
-                  <span className="badge warning">⚠ response refined</span>
+                {message.grounded === false && !message.corrected && (
+                  <span
+                    className="badge warning"
+                    title="The grounding check flagged this answer — it may not be fully grounded in the indexed sources."
+                  >
+                    ⚠ low confidence
+                  </span>
                 )}
               </div>
               <div className="message-body">
                 {message.content ? (
-                  renderMarkdown(message.content)
+                  <Markdown content={message.content} />
                 ) : (
                   <p className="thinking">Thinking…</p>
                 )}
@@ -417,9 +378,15 @@ function App() {
             placeholder="Ask about Tejasv’s projects, timeline, skills, or availability…"
             disabled={isStreaming}
           />
-          <button disabled={isStreaming || !input.trim()}>
-            {isStreaming ? "Streaming" : "Ask"}
-          </button>
+          {isStreaming ? (
+            <button type="button" onClick={stop}>
+              Stop
+            </button>
+          ) : (
+            <button type="submit" disabled={!input.trim()}>
+              Ask
+            </button>
+          )}
         </form>
       </section>
     </main>

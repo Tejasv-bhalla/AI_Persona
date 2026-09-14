@@ -1,10 +1,37 @@
-import logging
-from datetime import datetime
+"""Cal.com scheduling node.
 
-from rag_persona.schemas import PersonaState
+Voice mode runs an explicit `BookingStage` machine: the caller's position in the booking
+conversation comes from `state["booking_stage"]`, never from string-matching the assistant's
+own previous message. Chat mode is a separate one-shot path because the browser has a real
+booking form. Everything except the two Cal.com calls is a pure helper, so the stage handlers
+are testable without a live client.
+"""
+
+import logging
+import re
+from datetime import datetime
+from typing import Any, cast
+
+from rag_persona.config import Settings
+from rag_persona.schemas import BookingRequest, BookingStage, PersonaState
 from rag_persona.services.calcom import CalComClient
 
 logger = logging.getLogger(__name__)
+
+MAX_OFFERED_SLOTS = 5
+DEFAULT_ATTENDEE_NAME = "Recruiter"
+
+REJECTION_MARKERS = ("no", "nope", "does not work", "doesn't work", "cannot do", "can't do",
+                     "other time", "different time", "another time", "next")
+_NAME_FILLER_RE = re.compile(r"^(yeah|yes|sure|okay|hi|hello|hey|uhm|uh|ah|great)\b[\s.,!?]*", re.I)
+_NAME_PREFIXES = ("my name is", "this is", "i am", "sure, my name is", "sure, this is", "it is",
+                  "its")
+_EMAIL_RE = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*\.[a-zA-Z]{2,}")
+_EMAIL_PREFIXES = ("my email is", "email is", "send to", "address is", "email to",
+                   "email address is")
+_WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+_HOUR_WORDS = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six", 7: "seven",
+               8: "eight", 9: "nine", 10: "ten", 11: "eleven", 12: "twelve"}
 
 
 def format_ordinal(day: int) -> str:
@@ -13,390 +40,298 @@ def format_ordinal(day: int) -> str:
     return f"{day}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(day % 10, 'th') }"
 
 
-def to_spoken_slot(slot_str: str) -> str:
+def _parse_slot(slot: str) -> datetime | None:
     try:
-        dt = datetime.fromisoformat(slot_str.replace("Z", "+00:00"))
-        day_str = format_ordinal(dt.day)
-        time_str = dt.strftime("%I:%M %p").lstrip("0")
-        if time_str.endswith(":00 AM"):
-            time_str = time_str.replace(":00", "")
-        elif time_str.endswith(":00 PM"):
-            time_str = time_str.replace(":00", "")
-        return f"{dt.strftime('%A, %B')} {day_str} at {time_str}"
+        return datetime.fromisoformat(slot.replace("Z", "+00:00"))
     except Exception:
-        return slot_str
-
-
-def detect_slot_selection(raw_input: str, slots: list[str]) -> str | None:
-    """
-    Detect if the user selected one of the offered availability slots.
-    """
-    if not slots:
         return None
 
-    clean_input = raw_input.lower().strip()
 
-    # 1. Match ordinal references ("first", "second", "third", etc.)
-    ordinals = ["first", "second", "third", "fourth", "fifth"]
-    for idx, ord_word in enumerate(ordinals):
-        if ord_word in clean_input and idx < len(slots):
-            return slots[idx]
-
-    # 2. Match numeric choice references ("option two", "number one", etc.)
-    options = ["one", "two", "three", "four", "five"]
-    for idx, opt_word in enumerate(options):
-        if (f"option {opt_word}" in clean_input or f"number {opt_word}" in clean_input) and idx < len(slots):
-            return slots[idx]
-
-    # 3. Match weekday and exact time (e.g. "tuesday at 10:30" or "monday at 10")
-    for slot in slots:
-        try:
-            dt = datetime.fromisoformat(slot.replace("Z", "+00:00"))
-            weekday = dt.strftime("%A").lower()
-            if weekday not in clean_input:
-                continue
-                
-            hour = dt.strftime("%I").lstrip("0")  # "10", "2", etc.
-            hour_alt = dt.strftime("%-I")
-            minute = dt.minute  # integer: 0, 30, etc.
-            
-            # Check if hour is mentioned as digit or in word form
-            hour_mentioned = (
-                f" {hour} " in f" {clean_input} " 
-                or f" {hour_alt} " in f" {clean_input} " 
-                or f"{hour}:" in clean_input
-            )
-            
-            hour_words = {
-                1: "one", 2: "two", 3: "three", 4: "four", 5: "five",
-                6: "six", 7: "seven", 8: "eight", 9: "nine", 10: "ten",
-                11: "eleven", 12: "twelve"
-            }
-            h_int = int(hour)
-            if h_int in hour_words and hour_words[h_int] in clean_input:
-                hour_mentioned = True
-                
-            if not hour_mentioned:
-                continue
-                
-            # Check if minute matches
-            if minute == 0:
-                # If slot is on the hour, user shouldn't mention minutes like "30" or "thirty"
-                if "30" in clean_input or "thirty" in clean_input or "half past" in clean_input:
-                    continue
-                return slot
-            elif minute == 30:
-                if "30" in clean_input or "thirty" in clean_input or "half past" in clean_input:
-                    return slot
-        except Exception:
-            continue
-
-    # 4. Fallback match: if user mentions only the weekday and there is exactly one slot on that day
-    weekdays = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
-    mentioned_days = [day for day in weekdays if day in clean_input]
-    if len(mentioned_days) == 1:
-        matches = []
-        for slot in slots:
-            try:
-                dt = datetime.fromisoformat(slot.replace("Z", "+00:00"))
-                if dt.strftime("%A").lower() == mentioned_days[0]:
-                    matches.append(slot)
-            except Exception:
-                continue
-        if len(matches) == 1:
-            return matches[0]
-
-    return None
+def to_spoken_slot(slot_str: str) -> str:
+    dt = _parse_slot(slot_str)
+    if dt is None:
+        return slot_str
+    time_str = dt.strftime("%I:%M %p").lstrip("0")
+    if time_str.endswith((":00 AM", ":00 PM")):
+        time_str = time_str.replace(":00", "")
+    return f"{dt.strftime('%A, %B')} {format_ordinal(dt.day)} at {time_str}"
 
 
 def normalize_spoken_time(text: str) -> str:
-    """
-    Normalizes time text (converting word numbers/ordinals to digits) to allow robust comparisons.
-    """
-    mapping = {
-        "first": "1st", "second": "2nd", "third": "3rd", "fourth": "4th", "fifth": "5th",
-        "one": "1", "two": "2", "three": "3", "four": "4", "five": "5", "six": "6",
-        "seven": "7", "eight": "8", "eighth": "8th", "nine": "9", "ten": "10",
-        "eleven": "11", "twelve": "12", "thirty": "30", "am": "am", "pm": "pm"
-    }
-    import re
-    cleaned = text.lower()
-    cleaned = re.sub(r'[^a-z0-9]', ' ', cleaned)
-    tokens = cleaned.split()
-    normalized_tokens = [mapping.get(t, t) for t in tokens]
-    return " ".join(normalized_tokens)
+    """Normalize time text (word numbers/ordinals to digits) for robust comparison."""
+    mapping = {"first": "1st", "second": "2nd", "third": "3rd", "fourth": "4th", "fifth": "5th",
+               "one": "1", "two": "2", "three": "3", "four": "4", "five": "5", "six": "6",
+               "seven": "7", "eight": "8", "eighth": "8th", "nine": "9", "ten": "10",
+               "eleven": "11", "twelve": "12", "thirty": "30", "am": "am", "pm": "pm"}
+    cleaned = re.sub(r"[^a-z0-9]", " ", text.lower())
+    return " ".join(mapping.get(token, token) for token in cleaned.split())
 
 
-def extract_email(text: str) -> str | None:
-    """
-    Extracts email addresses from spoken transcription input, ensuring trailing punctuation is excluded.
-    """
-    import re
-    clean = text.lower().strip()
-    clean = clean.rstrip(".?!,")
-    
-    # Handle verbal and phonetic mis-transcriptions (e.g. "at the rate" -> "@", "third egg mail" -> "gmail")
-    clean = clean.replace("at the rate of", "@").replace("at the rate", "@").replace("third egg mail", "gmail")
-    clean = clean.replace("[at]", "@").replace("[dot]", ".").replace(" at ", "@").replace(" dot ", ".")
-    
-    # Strip spaces around @ and .
-    clean = re.sub(r'\s*@\s*', '@', clean)
-    clean = re.sub(r'\s*\.\s*', '.', clean)
-    
-    # A standard email regex search that forces the domain to end with an alphanumeric character
-    match = re.search(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-]*[a-zA-Z0-9]", clean)
-    if match:
-        return match.group(0).rstrip(".")
-    
-    # If not matched, remove all spaces and try again
-    prefixes = ["my email is", "email is", "send to", "address is", "email to", "email address is"]
-    temp = clean
-    for prefix in prefixes:
-        if temp.startswith(prefix):
-            temp = temp[len(prefix):].strip()
-            
-    spaced_clean = re.sub(r'\s+', '', temp)
-    match = re.search(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-]*[a-zA-Z0-9]", spaced_clean)
-    if match:
-        return match.group(0).rstrip(".")
-        
+def detect_slot_selection(raw_input: str, slots: list[str]) -> str | None:
+    """Detect whether the caller named one of the offered slots outright."""
+    if not slots:
+        return None
+    clean_input = raw_input.lower().strip()
+
+    # 1. Ordinal references ("first", "second", ...).
+    for idx, ord_word in enumerate(["first", "second", "third", "fourth", "fifth"]):
+        if ord_word in clean_input and idx < len(slots):
+            return slots[idx]
+
+    # 2. Numeric choice references ("option two", "number one", ...).
+    for idx, word in enumerate(["one", "two", "three", "four", "five"]):
+        if idx < len(slots) and (f"option {word}" in clean_input
+                                 or f"number {word}" in clean_input):
+            return slots[idx]
+
+    # 3. Weekday plus an exact time ("tuesday at 10:30", "monday at 10").
+    for slot in slots:
+        dt = _parse_slot(slot)
+        if dt is None or dt.strftime("%A").lower() not in clean_input:
+            continue
+        hour = dt.strftime("%I").lstrip("0")
+        if not (f" {hour} " in f" {clean_input} " or f" {dt.strftime('%-I')} " in f" {clean_input} "
+                or f"{hour}:" in clean_input or _HOUR_WORDS.get(int(hour), "\0") in clean_input):
+            continue
+        half_past = "30" in clean_input or "thirty" in clean_input or "half past" in clean_input
+        if (dt.minute == 0 and not half_past) or (dt.minute == 30 and half_past):
+            return slot
+
+    # 4. Weekday alone, when exactly one slot falls on that day.
+    mentioned = [day for day in _WEEKDAYS if day in clean_input]
+    if len(mentioned) == 1:
+        days = [(s, _parse_slot(s)) for s in slots]
+        matches = [s for s, dt in days if dt and dt.strftime("%A").lower() == mentioned[0]]
+        if len(matches) == 1:
+            return matches[0]
     return None
 
 
+def is_rejection(text: str) -> bool:
+    return any(marker in text.lower() for marker in REJECTION_MARKERS)
 
 
-async def calcom_node(
-    state: PersonaState,
-    settings,
-    calcom: CalComClient | None,
-) -> PersonaState:
+def extract_name(text: str) -> str:
+    """Pull a name out of an utterance, stripping filler words and spoken lead-ins."""
+    clean = _NAME_FILLER_RE.sub("", text.strip()).strip()
+    lowered = clean.lower()
+    for prefix in _NAME_PREFIXES:
+        if lowered.startswith(prefix):
+            clean = clean[len(prefix):].strip()
+            break
+    return clean.title()
+
+
+def extract_email(text: str) -> str | None:
+    """Extract an email address from a (frequently mangled) speech transcript."""
+    clean = text.lower().strip().rstrip(".?!,")
+
+    # Transcription workarounds, NOT dead code: speech-to-text renders spoken addresses as
+    # "at the rate" / "third egg mail" / "dot". Deleting these breaks voice booking.
+    clean = clean.replace("at the rate of", "@").replace("at the rate", "@")
+    clean = clean.replace("third egg mail", "gmail")
+    clean = clean.replace("[at]", "@").replace("[dot]", ".")
+    clean = clean.replace(" at ", "@").replace(" dot ", ".")
+
+    clean = re.sub(r"\s*@\s*", "@", clean)
+    clean = re.sub(r"\s*\.\s*", ".", clean)
+
+    # Retry with every space removed, after dropping any spoken lead-in.
+    despaced = clean
+    for prefix in _EMAIL_PREFIXES:
+        if despaced.startswith(prefix):
+            despaced = despaced[len(prefix):].strip()
+    despaced = re.sub(r"\s+", "", despaced)
+
+    match = _EMAIL_RE.search(clean)
+    if match is None:
+        fallback = _EMAIL_RE.search(despaced)
+        return fallback.group(0).rstrip(".") if fallback else None
+
+    # A one- or two-character local part means we matched the tail of a spelled-out
+    # address ("j o h n at gmail dot com" -> "n@gmail.com"). Prefer the despaced read.
+    if len(match.group(0).split("@")[0]) <= 2:
+        spelled = _EMAIL_RE.search(despaced)
+        if spelled and len(spelled.group(0).split("@")[0]) > 2:
+            return spelled.group(0).rstrip(".")
+    return match.group(0).rstrip(".")
+
+
+def parse_slots(payload: object) -> list[str]:
+    """Flatten a Cal.com availability payload into a date-ordered list of ISO timestamps."""
+    slots_data: object = {}
+    if isinstance(payload, dict):
+        inner = payload.get("data", {})
+        slots_data = inner.get("slots", {}) if isinstance(inner, dict) else payload.get("slots", {})
+
+    slots: list[str] = []
+    if isinstance(slots_data, dict):
+        for _, time_slots in sorted(slots_data.items()):
+            if not isinstance(time_slots, list):
+                continue
+            for slot in time_slots:
+                if isinstance(slot, dict) and "time" in slot:
+                    slots.append(str(slot["time"]))
+                elif isinstance(slot, str):
+                    slots.append(slot)
+    return slots
+
+
+def calendar_unavailable_message(mode: str, username: str) -> str:
+    """The friendly cal.com-link fallback used whenever Cal.com cannot be reached."""
+    if mode == "voice":
+        return (f"I'm having a bit of trouble accessing the calendar right now. You can book "
+                f"directly at cal.com/{username} — Tejasv has good availability and would love "
+                f"to connect.")
+    return (f"I'm having trouble accessing the calendar right now. "
+            f"You can book directly at cal.com/{username}")
+
+
+def _reply(state: PersonaState, answer: str, **updates: Any) -> PersonaState:
+    """Build this turn's state update: the spoken answer plus any booking-state changes."""
+    return cast(PersonaState, {**state, "answer": answer, **updates})
+
+
+def _abandon(state: PersonaState, answer: str) -> PersonaState:
+    """Leave the booking flow with a message and a clean slate, so a retry re-fetches."""
+    return _reply(state, answer, booking_stage=BookingStage.idle, booking_slots=[],
+                  booking_slot_index=0)
+
+
+def handle_idle(state: PersonaState, slots: list[str]) -> PersonaState:
+    """Entry: pin the fetched slots into state and offer the first one."""
+    return _reply(state,
+                  f"My next available slot is {to_spoken_slot(slots[0])}. Does that work for you?",
+                  booking_stage=BookingStage.offering, booking_slots=slots,
+                  booking_slot_index=0, available_slots=slots)
+
+
+def _accept_slot(state: PersonaState, index: int) -> PersonaState:
+    return _reply(state, "Great! Can I get your name first?",
+                  booking_stage=BookingStage.awaiting_name, booking_slot_index=index)
+
+
+def handle_offering(state: PersonaState, slots: list[str], username: str) -> PersonaState:
+    """Interpret the reply against the slot that was actually offered."""
+    raw_input = state.get("raw_input", "")
+    index = state.get("booking_slot_index", 0)
+
+    # An explicitly named slot ("the third one", "Tuesday at 10:30") outranks a rejection marker,
+    # so "no, Tuesday at two works better" jumps instead of blindly skipping ahead.
+    if (chosen := detect_slot_selection(raw_input, slots)) is not None:
+        return _accept_slot(state, slots.index(chosen))
+    if not is_rejection(raw_input):
+        return _accept_slot(state, index)
+
+    next_index = index + 1
+    if next_index >= len(slots):
+        return _abandon(state, f"Those are all the slots I have in the near future. You can check "
+                               f"my full calendar at cal.com/{username} to find another time.")
+    return _reply(state, f"No problem. How about {to_spoken_slot(slots[next_index])}?",
+                  booking_stage=BookingStage.offering, booking_slots=slots,
+                  booking_slot_index=next_index)
+
+
+def handle_awaiting_name(state: PersonaState) -> PersonaState:
+    name = extract_name(state.get("raw_input", "")) or DEFAULT_ATTENDEE_NAME
+    return _reply(state,
+                  f"Thanks, {name}. And what email address should I send the calendar "
+                  f"invitation to?",
+                  booking_stage=BookingStage.awaiting_email, booking_name=name)
+
+
+async def handle_awaiting_email(state: PersonaState, calcom: CalComClient,
+                                username: str) -> PersonaState:
+    email = extract_email(state.get("raw_input", ""))
+    if email is None:
+        # Stay put and re-prompt: the stored name and slot index survive untouched.
+        return _reply(state, "I'm sorry, I didn't quite catch the email address. Could you please "
+                             "spell it out or state it again?",
+                      booking_stage=BookingStage.awaiting_email)
+
+    slots = state.get("booking_slots", [])
+    index = state.get("booking_slot_index", 0)
+    if not slots or index >= len(slots):
+        return _abandon(state, f"I'm sorry, I lost track of which slot you selected. "
+                               f"You can book directly at cal.com/{username}.")
+
+    slot = slots[index]
+    spoken_date = to_spoken_slot(slot)
+    try:
+        await calcom.create_booking(BookingRequest(
+            preferred_time=slot,
+            attendee_name=state.get("booking_name") or DEFAULT_ATTENDEE_NAME,
+            attendee_email=email,
+            notes=None,
+        ))
+    except Exception:
+        logger.exception("Failed to create Cal.com booking")
+        return _abandon(state, f"I ran into an issue finalizing the booking on the calendar. "
+                               f"However, I have saved your preference for {spoken_date} at "
+                               f"{email}. You can also visit cal.com/{username} to secure it.")
+
+    return _reply(state,
+                  f"Perfect! I've booked our meeting for {spoken_date} and sent the calendar "
+                  f"invitation to {email}. You're all set! Is there anything else I can help "
+                  f"you with?",
+                  booking_stage=BookingStage.confirmed, booking_email=email)
+
+
+def handle_confirmed(state: PersonaState) -> PersonaState:
+    """The meeting is already booked — acknowledge, never rebook."""
+    email = state.get("booking_email", "")
+    return _reply(state,
+                  f"We're all set — that meeting is already on the calendar and the invitation is "
+                  f"on its way{f' to {email}' if email else ''}. Is there anything else I can "
+                  f"help you with?",
+                  booking_stage=BookingStage.confirmed)
+
+
+async def _voice_turn(state: PersonaState, calcom: CalComClient, username: str) -> PersonaState:
+    stage = state.get("booking_stage", BookingStage.idle)
+    if stage == BookingStage.confirmed:
+        return handle_confirmed(state)
+    if stage == BookingStage.awaiting_name:
+        return handle_awaiting_name(state)
+    if stage == BookingStage.awaiting_email:
+        return await handle_awaiting_email(state, calcom, username)
+
+    # idle and offering both need the slot list. Fetch it ONCE per call and reuse it: re-fetching
+    # each turn lets availability shift underneath "the second one" mid-conversation.
+    slots = state.get("booking_slots") or []
+    if not slots:
+        slots = parse_slots(await calcom.get_available_slots())[:MAX_OFFERED_SLOTS]
+    if not slots:
+        return _abandon(state, f"I couldn't find any available slots in the next seven days. "
+                               f"You can check my calendar directly at cal.com/{username}.")
+    if stage == BookingStage.offering:
+        return handle_offering(state, slots, username)
+    return handle_idle(state, slots)
+
+
+async def _chat_turn(state: PersonaState, calcom: CalComClient, username: str) -> PersonaState:
+    """Chat mode skips the stage machine entirely — the frontend has a real booking form."""
+    slots = parse_slots(await calcom.get_available_slots())[:MAX_OFFERED_SLOTS]
+    formatted = [dt.strftime("%A, %B %d, %Y at %I:%M %p") if (dt := _parse_slot(s)) else s
+                 for s in slots]
+    slots_list = "\n".join(f"- {s}" for s in formatted)
+    return _reply(state,
+                  "Here are my next available slots. Please choose one and click to book:\n\n"
+                  f"{slots_list}\n\n"
+                  f"Or you can visit my booking page directly: https://cal.com/{username}",
+                  available_slots=slots)
+
+
+async def calcom_node(state: PersonaState, settings: Settings,
+                      calcom: CalComClient | None) -> PersonaState:
     username = settings.calcom_username or "tejasv"
     mode = state.get("mode", "chat")
-    raw_input = state.get("raw_input", "")
-
     if calcom is None or not calcom.configured:
-        if mode == "voice":
-            return {
-                **state,
-                "answer": f"I'm having a bit of trouble accessing the calendar right now. You can book directly at cal.com/{username} — Tejasv has good availability and would love to connect.",
-            }
-        return {
-            **state,
-            "answer": f"I'm having trouble accessing the calendar right now. You can book directly at cal.com/{username}",
-        }
-
+        return _reply(state, calendar_unavailable_message(mode, username))
     try:
-        # Fetch slots from Cal.com
-        data = await calcom.get_available_slots()
-        slots_data = {}
-        if isinstance(data, dict):
-            inner_data = data.get("data", {})
-            if isinstance(inner_data, dict):
-                slots_data = inner_data.get("slots", {})
-            else:
-                slots_data = data.get("slots", {})
-
-        slots = []
-        if isinstance(slots_data, dict):
-            for _, time_slots in sorted(slots_data.items()):
-                if isinstance(time_slots, list):
-                    for slot in time_slots:
-                        if isinstance(slot, dict) and "time" in slot:
-                            slots.append(slot["time"])
-                        elif isinstance(slot, str):
-                            slots.append(slot)
-
-        slots = slots[:5]
-
-        # Handle voice email collection and booking
         if mode == "voice":
-            history = state.get("conversation_history", [])
-            
-            # Helper to extract name with filler word stripping
-            def extract_name(text: str) -> str:
-                import re
-                clean = text.strip()
-                # Strip conversational filler words and leading punctuation
-                clean = re.sub(r'^(yeah|yes|sure|okay|hi|hello|hey|uhm|uh|ah|great)\b[\s.,!?]*', '', clean, flags=re.IGNORECASE).strip()
-                prefixes = ["my name is", "this is", "i am", "sure, my name is", "sure, this is", "it is", "its"]
-                lowered = clean.lower()
-                for prefix in prefixes:
-                    if lowered.startswith(prefix):
-                        clean = clean[len(prefix):].strip()
-                        break
-                return clean.title()
-
-            # Determine conversational state from history
-            last_assistant_msg = ""
-            for msg in reversed(history):
-                if msg.get("role") == "assistant":
-                    last_assistant_msg = msg.get("content", "")
-                    break
-
-            # State A: Expecting email
-            if last_assistant_msg and ("email address" in last_assistant_msg.lower() or "what email" in last_assistant_msg.lower() or "send the invitation to" in last_assistant_msg.lower() or "send the invite to" in last_assistant_msg.lower()):
-                email = extract_email(raw_input)
-                if email:
-                    # Find name from history
-                    name = "Recruiter"
-                    for msg in reversed(history):
-                        if msg.get("role") == "assistant" and "can i get your name first" in msg.get("content", "").lower():
-                            idx = history.index(msg)
-                            if idx + 1 < len(history) and history[idx + 1].get("role") == "user":
-                                name = extract_name(history[idx + 1].get("content", ""))
-                                break
-
-                    # Find selected slot from history using normalized spoken time comparison
-                    selected_slot = None
-                    for msg in reversed(history):
-                        if msg.get("role") == "assistant" and ("does that work for you" in msg.get("content", "").lower() or "how about" in msg.get("content", "").lower()):
-                            norm_msg = normalize_spoken_time(msg.get("content", ""))
-                            for s in slots:
-                                norm_slot = normalize_spoken_time(to_spoken_slot(s))
-                                if norm_slot in norm_msg:
-                                    selected_slot = s
-                                    break
-                            if selected_slot:
-                                break
-
-                    if not selected_slot and slots:
-                        selected_slot = slots[0]
-
-                    if selected_slot:
-                        from rag_persona.schemas import BookingRequest
-                        spoken_date = to_spoken_slot(selected_slot)
-                        try:
-                            req = BookingRequest(
-                                preferred_time=selected_slot,
-                                attendee_name=name,
-                                attendee_email=email,
-                                notes=None
-                            )
-                            await calcom.create_booking(req)
-                            answer = f"Perfect! I've booked our meeting for {spoken_date} and sent the calendar invitation to {email}. You're all set! Is there anything else I can help you with?"
-                            return {
-                                **state,
-                                "answer": answer,
-                                "selected_slot": selected_slot,
-                                "booking_confirmed": True
-                            }
-                        except Exception:
-                            logger.exception("Failed to create Cal.com booking")
-                            answer = f"I ran into an issue finalizing the booking on the calendar. However, I have saved your preference for {spoken_date} at {email}. You can also visit cal.com/{username} to secure it."
-                            return {
-                                **state,
-                                "answer": answer,
-                            }
-                    else:
-                        answer = f"I'm sorry, I lost track of which slot you selected. You can book directly at cal.com/{username}."
-                        return {
-                            **state,
-                            "answer": answer,
-                        }
-                else:
-                    answer = "I'm sorry, I didn't quite catch the email address. Could you please spell it out or state it again?"
-                    return {
-                        **state,
-                        "answer": answer,
-                    }
-
-            # State B: Expecting name
-            elif last_assistant_msg and "can i get your name first" in last_assistant_msg.lower():
-                name = extract_name(raw_input)
-                answer = f"Thanks, {name}. And what email address should I send the calendar invitation to?"
-                return {
-                    **state,
-                    "answer": answer,
-                }
-
-            # State C: Negotiating slots (offering one by one)
-            elif last_assistant_msg and ("does that work for you" in last_assistant_msg.lower() or "how about" in last_assistant_msg.lower()):
-                negatives = ["no", "nope", "does not work", "doesn't work", "cannot do", "can't do", "other time", "different time", "next"]
-                user_rejected = any(neg in raw_input.lower() for neg in negatives)
-
-                last_offered_idx = -1
-                norm_last_msg = normalize_spoken_time(last_assistant_msg)
-                for s_idx, s in enumerate(slots):
-                    norm_slot = normalize_spoken_time(to_spoken_slot(s))
-                    if norm_slot in norm_last_msg:
-                        last_offered_idx = s_idx
-                        break
-
-                if user_rejected:
-                    next_idx = last_offered_idx + 1
-                    if next_idx < len(slots):
-                        next_spoken = to_spoken_slot(slots[next_idx])
-                        answer = f"No problem. How about {next_spoken}?"
-                        return {
-                            **state,
-                            "answer": answer,
-                        }
-                    else:
-                        answer = f"Those are all the slots I have in the near future. You can check my full calendar at cal.com/{username} to find another time."
-                        return {
-                            **state,
-                            "answer": answer,
-                        }
-                else:
-                    answer = "Great! Can I get your name first?"
-                    return {
-                        **state,
-                        "answer": answer,
-                    }
-
-            # State D: Start slot negotiation (offer the first slot)
-            else:
-                if slots:
-                    first_spoken = to_spoken_slot(slots[0])
-                    answer = f"My next available slot is {first_spoken}. Does that work for you?"
-                    return {
-                        **state,
-                        "answer": answer,
-                        "available_slots": slots,
-                    }
-                else:
-                    answer = f"I couldn't find any available slots in the next seven days. You can check my calendar directly at cal.com/{username}."
-                    return {
-                        **state,
-                        "answer": answer,
-                    }
-
-            return {
-                **state,
-                "answer": answer,
-                "available_slots": slots,
-            }
-
-        formatted_slots = []
-        for slot in slots:
-            try:
-                dt = datetime.fromisoformat(slot.replace("Z", "+00:00"))
-                formatted_slots.append(dt.strftime("%A, %B %d, %Y at %I:%M %p"))
-            except Exception:
-                formatted_slots.append(slot)
-
-        slots_list_str = "\n".join(f"- {s}" for s in formatted_slots)
-
-        answer = (
-            "Here are my next available slots. Please choose one and click to book:\n\n"
-            f"{slots_list_str}\n\n"
-            f"Or you can visit my booking page directly: https://cal.com/{username}"
-        )
-
-        return {
-            **state,
-            "answer": answer,
-            "available_slots": slots,
-        }
-
+            return await _voice_turn(state, calcom, username)
+        return await _chat_turn(state, calcom, username)
     except Exception:
-        logger.exception("Failed to fetch slots from Cal.com")
-        if mode == "voice":
-            return {
-                **state,
-                "answer": f"I'm having a bit of trouble accessing the calendar right now. You can book directly at cal.com/{username} — Tejasv has good availability and would love to connect.",
-            }
-        return {
-            **state,
-            "answer": f"I'm having trouble accessing the calendar right now. You can book directly at cal.com/{username}",
-        }
+        logger.exception("Cal.com scheduling turn failed")
+        return _reply(state, calendar_unavailable_message(mode, username))

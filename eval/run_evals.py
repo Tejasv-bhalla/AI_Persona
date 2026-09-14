@@ -108,9 +108,19 @@ BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "tejasv_knowledge_base")
+# /chat/eval is gated: it returns 404 unless the backend has EVAL_API_KEY set and
+# the same value is sent here.
+EVAL_API_KEY = os.getenv("EVAL_API_KEY", "")
+EVAL_HEADERS = {"x-eval-key": EVAL_API_KEY} if EVAL_API_KEY else {}
+# One chat turn costs ~413 Groq output tokens (guard + generation + grader) and the
+# free tier allows 1000 per minute, so the backend can serve ~2.4 turns/min. Without
+# pacing the run collapses into 429s. Override for a paid tier.
+BACKEND_REQUEST_DELAY = float(os.getenv("BACKEND_REQUEST_DELAY_SECONDS", "25"))
 
 print(f"Configured with Backend: {BACKEND_URL}")
 print(f"Configured with Qdrant Collection: {QDRANT_COLLECTION}")
+if not EVAL_API_KEY:
+    print("WARNING: EVAL_API_KEY is unset — /chat/eval will reject every request.")
 
 async def check_qdrant_health():
     print("\n=== STEP 1: QDRANT COLLECTION HEALTH ===")
@@ -162,34 +172,52 @@ async def measure_chat_latency(questions):
     print("\n=== STEP 2: CHAT LATENCY MEASUREMENT ===")
     latency_results = []
     
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=90) as client:
         for item in questions:
             qid = item["id"]
             q_text = item["question"]
             print(f"Measuring latency for Q{qid}...")
+            await asyncio.sleep(BACKEND_REQUEST_DELAY)
             
             start_time = time.perf_counter()
             first_token_time = None
-            
+            first_event_time = None
+
             try:
                 # Call /chat SSE streaming endpoint
                 async with client.stream("POST", f"{BACKEND_URL}/chat", json={"message": q_text}) as response:
                     response.raise_for_status()
                     async for line in response.aiter_lines():
-                        if line.startswith("data:"):
-                            if first_token_time is None:
-                                first_token_time = time.perf_counter()
-                
+                        if not line.startswith("data:"):
+                            continue
+                        if first_event_time is None:
+                            first_event_time = time.perf_counter()
+                        # The first SSE frame is `meta` (the route), emitted after guard
+                        # and router but BEFORE generation starts. Timing that frame
+                        # measures routing latency, not time-to-first-token. Only a
+                        # `token` frame means the model has actually begun answering.
+                        if first_token_time is None:
+                            try:
+                                if json.loads(line[len("data:"):].strip()).get("type") == "token":
+                                    first_token_time = time.perf_counter()
+                            except json.JSONDecodeError:
+                                pass
+
                 end_time = time.perf_counter()
                 
                 ttft_ms = round((first_token_time - start_time) * 1000, 2) if first_token_time else None
+                first_event_ms = (
+                    round((first_event_time - start_time) * 1000, 2) if first_event_time else None
+                )
                 total_latency_ms = round((end_time - start_time) * 1000, 2)
-                
-                print(f"  TTFT: {ttft_ms} ms | Total: {total_latency_ms} ms")
+
+                print(f"  TTFT: {ttft_ms} ms | first SSE event: {first_event_ms} ms "
+                      f"| Total: {total_latency_ms} ms")
                 latency_results.append({
                     "id": qid,
                     "question": q_text,
                     "ttft_ms": ttft_ms,
+                    "first_event_ms": first_event_ms,
                     "total_latency_ms": total_latency_ms
                 })
             except Exception as e:
@@ -198,6 +226,7 @@ async def measure_chat_latency(questions):
                     "id": qid,
                     "question": q_text,
                     "ttft_ms": None,
+                    "first_event_ms": None,
                     "total_latency_ms": None
                 })
                 
@@ -218,17 +247,27 @@ async def collect_responses(questions):
     print("\n=== STEP 3: RESPONSE COLLECTION ===")
     responses = []
     
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=90) as client:
         for item in questions:
             qid = item["id"]
             q_text = item["question"]
             expected = item["expected_answer"]
             source = item["source_type"]
             print(f"Collecting response for Q{qid}...")
+            await asyncio.sleep(BACKEND_REQUEST_DELAY)
             
             try:
                 # Call /chat/eval endpoint
-                res = await client.post(f"{BACKEND_URL}/chat/eval", json={"message": q_text})
+                res = await client.post(
+                    f"{BACKEND_URL}/chat/eval",
+                    json={"message": q_text},
+                    headers=EVAL_HEADERS,
+                )
+                if res.status_code in (401, 404):
+                    raise RuntimeError(
+                        "/chat/eval rejected the request. Set EVAL_API_KEY in eval/.env to the "
+                        "same value as the backend's EVAL_API_KEY."
+                    )
                 res.raise_for_status()
                 data = res.json()
                 
@@ -349,14 +388,9 @@ async def run_ragas_evaluation(responses):
             "context_recall": float(df["context_recall"].mean())
         }
     except Exception as e:
-        print(f"Ragas evaluation encountered an error: {e}")
-        # Return fallback/default values if Ragas fails due to dependencies or rate limits
-        return {
-            "faithfulness": 0.88,
-            "answer_relevancy": 0.89,
-            "context_precision": 0.85,
-            "context_recall": 0.84
-        }
+        # Never substitute placeholder scores here. A silent fallback would emit
+        # plausible-looking metrics that are indistinguishable from measured ones.
+        raise RuntimeError(f"Ragas evaluation failed; refusing to report fabricated scores: {e}") from e
 
 async def run_custom_judge(responses):
     print("\n=== STEP 5: CUSTOM JUDGE EVALUATION ===")
@@ -412,8 +446,10 @@ Return only JSON: {{"verdict": "correct|partial|hallucinated|refused", "reason":
             verdict = verdict_data.get("verdict", "refused")
             reason = verdict_data.get("reason", "")
         except Exception as e:
+            # Distinct from a genuine "refused" verdict: this is harness failure,
+            # not model behaviour. Counting it as refusal would corrupt the rates.
             print(f"  Judge completion failed: {e}")
-            verdict = "refused"
+            verdict = "error"
             reason = str(e)
             
         print(f"  Verdict: {verdict} | Reason: {reason}")
@@ -435,8 +471,17 @@ Return only JSON: {{"verdict": "correct|partial|hallucinated|refused", "reason":
     partial = sum(1 for r in judge_results if r["verdict"] == "partial")
     hallucinated = sum(1 for r in judge_results if r["verdict"] == "hallucinated")
     refused = sum(1 for r in judge_results if r["verdict"] == "refused")
+    errored = sum(1 for r in judge_results if r["verdict"] == "error")
     
-    print(f"\nJudge Verdicts: Correct={correct}/{total}, Partial={partial}/{total}, Hallucinated={hallucinated}/{total}, Refused={refused}/{total}")
+    print(
+        f"\nJudge Verdicts: Correct={correct}/{total}, Partial={partial}/{total}, "
+        f"Hallucinated={hallucinated}/{total}, Refused={refused}/{total}, Errored={errored}/{total}"
+    )
+    if errored:
+        raise RuntimeError(
+            f"{errored}/{total} judge calls failed. Results are incomplete; fix the harness "
+            "before reporting these numbers."
+        )
     return {
         "correct": correct,
         "partial": partial,

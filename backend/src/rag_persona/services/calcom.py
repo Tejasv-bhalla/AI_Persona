@@ -9,7 +9,10 @@ from rag_persona.schemas import BookingRequest
 class CalComClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.client = httpx.AsyncClient(timeout=20)
+        self.client = httpx.AsyncClient(timeout=settings.request_timeout_seconds)
+
+    async def aclose(self) -> None:
+        await self.client.aclose()
 
     @property
     def configured(self) -> bool:
@@ -34,7 +37,7 @@ class CalComClient:
         start_time = now.isoformat()
         end_time = (now + timedelta(days=7)).isoformat()
 
-        params = {
+        params: dict[str, str | int] = {
             "eventTypeId": int(self.settings.calcom_event_type_id),
             "startTime": start_time,
             "endTime": end_time,
@@ -47,7 +50,8 @@ class CalComClient:
             headers=self._headers(),
         )
         response.raise_for_status()
-        return response.json()
+        slots: dict[str, object] = response.json()
+        return slots
 
     async def create_booking(self, request: BookingRequest) -> dict[str, object]:
         if not self.configured:
@@ -63,8 +67,6 @@ class CalComClient:
             },
             "metadata": {},
         }
-        # Note: Cal.com v2 API does not allow 'description' at the root level
-        pass
 
         response = await self.client.post(
             "https://api.cal.com/v2/bookings",
@@ -72,4 +74,5 @@ class CalComClient:
             headers=self._headers(),
         )
         response.raise_for_status()
-        return response.json()
+        booking: dict[str, object] = response.json()
+        return booking

@@ -1,32 +1,32 @@
 {
   "total_questions": 10,
-  "median_first_token_latency_ms": 981.22,
-  "p95_first_token_latency_ms": 1786.4,
+  "median_first_token_latency_ms": 2190.4,
+  "p95_first_token_latency_ms": 3121.92,
   "ragas": {
-    "faithfulness": 0.967687074829932,
-    "answer_relevancy": 0.6741752992270253,
-    "context_precision": 0.5476190475785715,
-    "context_recall": 0.5714285714285714
+    "faithfulness": 0.6964285714285714,
+    "answer_relevancy": 0.6557690971912329,
+    "context_precision": 0.547619047582738,
+    "context_recall": 0.7142857142857143
   },
   "judge": {
-    "correct_rate": 60.0,
+    "correct_rate": 80.0,
     "hallucination_rate": 0.0,
-    "refusal_rate": 20.0,
-    "partial_rate": 20.0,
+    "refusal_rate": 10.0,
+    "partial_rate": 10.0,
     "counts": {
-      "correct": 6,
-      "partial": 2,
+      "correct": 8,
+      "partial": 1,
       "hallucinated": 0,
-      "refused": 2
+      "refused": 1
     }
   },
   "collection_health": {
-    "unknown": 87,
-    "code": 941,
+    "unknown": 182,
+    "code": 1182,
+    "readme": 351,
     "notebook-output": 46,
-    "readme": 276,
-    "changelog": 12,
-    "resume": 5,
+    "changelog": 15,
+    "resume": 7,
     "contribution-scope": 4
   }
 }

@@ -1,3 +1,4 @@
+import math
 from uuid import NAMESPACE_URL, uuid5
 
 from qdrant_client import QdrantClient
@@ -13,10 +14,13 @@ class QdrantStore:
         if settings.qdrant_url is None:
             raise RuntimeError("QDRANT_URL is required")
         self.settings = settings
+        self._repo_names: list[str] | None = None
         self.client = QdrantClient(
             url=str(settings.qdrant_url),
             api_key=settings.qdrant_api_key or None,
-            timeout=settings.request_timeout_seconds,
+            # qdrant-client types timeout as int and rounds it up internally; do the
+            # same here so the float setting matches the declared signature.
+            timeout=math.ceil(settings.request_timeout_seconds),
         )
 
     def ensure_collection(self) -> None:
@@ -90,29 +94,56 @@ class QdrantStore:
                 )
             self.client.upsert(collection_name=self.settings.qdrant_collection, points=points)
 
-    def point_exists(self, chunk_id: str) -> bool:
-        """Check whether a point with the stable chunk_id already exists in the collection."""
-        point_id = str(uuid5(NAMESPACE_URL, str(chunk_id)))
+    def repo_names(self) -> list[str]:
+        """Distinct repo_name values in the collection, cached after the first successful call."""
+        if self._repo_names is not None:
+            return self._repo_names
+        names: set[str] = set()
         try:
-            # qdrant-client exposes get_point which returns None or raises on missing
-            self.client.get_point(collection_name=self.settings.qdrant_collection, point_id=point_id)
-            return True
+            offset = None
+            while True:
+                points, offset = self.client.scroll(
+                    collection_name=self.settings.qdrant_collection,
+                    limit=512,
+                    offset=offset,
+                    with_payload=["repo_name"],
+                    with_vectors=False,
+                )
+                for point in points:
+                    name = (point.payload or {}).get("repo_name")
+                    if isinstance(name, str) and name:
+                        names.add(name)
+                if offset is None:
+                    break
         except Exception:
-            return False
+            return []
+        self._repo_names = sorted(names)
+        return self._repo_names
 
     def delete_by_repo(self, repo_name: str, dry_run: bool = False) -> int:
-        """Delete points matching repo_name. Returns number of points deleted (best effort)."""
-        from qdrant_client.http import models as _models
-
-        filt = _models.Filter(must=[_models.FieldCondition(key="repo_name", match=_models.MatchValue(value=repo_name))])
-        # preview count
-        count = self.client.count(collection_name=self.settings.qdrant_collection, filter=filt)
-        to_delete = count.count if hasattr(count, "count") else 0
-        if dry_run or to_delete == 0:
-            return int(to_delete)
-        # perform delete
-        self.client.delete(collection_name=self.settings.qdrant_collection, filter=filt)
-        return int(to_delete)
+        """Delete every point belonging to a repo. Returns the number of points matched."""
+        selector = models.FilterSelector(
+            filter=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="repo_name",
+                        match=models.MatchValue(value=repo_name),
+                    )
+                ]
+            )
+        )
+        matched = self.client.count(
+            collection_name=self.settings.qdrant_collection,
+            count_filter=selector.filter,
+            exact=True,
+        ).count
+        if dry_run or matched == 0:
+            return int(matched)
+        self.client.delete(
+            collection_name=self.settings.qdrant_collection,
+            points_selector=selector,
+        )
+        return int(matched)
 
     def search(
         self,
@@ -122,7 +153,7 @@ class QdrantStore:
         sparse_query: SparseVector | None = None,
         repo_filter: str | None = None,
     ) -> list[RetrievedChunk]:
-        must_conditions = []
+        must_conditions: list[models.Condition] = []
         if source_filter and source_filter != SourceType.unknown:
             must_conditions.append(
                 models.FieldCondition(
@@ -163,7 +194,7 @@ class QdrantStore:
                 query=models.FusionQuery(fusion=models.Fusion.RRF),
                 limit=limit,
                 with_payload=True,
-                with_vectors=True,
+                with_vectors=False,
             )
             results = response.points
         else:
@@ -174,19 +205,13 @@ class QdrantStore:
                 query_filter=query_filter,
                 limit=limit,
                 with_payload=True,
-                with_vectors=True,
+                with_vectors=False,
             )
             results = response.points
 
         chunks: list[RetrievedChunk] = []
         for result in results:
             payload = result.payload or {}
-            vector = result.vector
-            dense_vector: list[float] | None = None
-            if isinstance(vector, dict) and isinstance(vector.get("dense"), list):
-                dense_vector = [float(item) for item in vector["dense"]]
-            if dense_vector is not None:
-                payload = {**payload, "dense_vector": dense_vector}
             chunks.append(
                 RetrievedChunk(
                     chunk_id=str(payload.get("chunk_id", result.id)),

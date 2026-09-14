@@ -1,7 +1,54 @@
+import re
+
 from rag_persona.config import Settings
 from rag_persona.prompts import GUARD_PROMPT, VOICE_GUARD_PROMPT
 from rag_persona.schemas import GuardResult, Intent, PersonaState, SafetyVerdict, SourceType
 from rag_persona.services.groq_client import GroqClient
+
+# Word-boundary matched, not substring: "hi" must not fire inside "his"/"this",
+# "book" inside "notebook", or "call" inside "recall".
+_END_CALL_RE = re.compile(r"\b(goodbye|bye|talk later|have a good day)\b")
+_SCHEDULING_RE = re.compile(r"\b(book|booking|schedule|calendar|meeting|call)\b")
+_SMALL_TALK_RE = re.compile(r"\b(hi|hello|hey|thanks)\b")
+
+# Vocabularies for the fast path below. Deliberately small: a turn only skips the
+# classifier when EVERY word it contains is in one of these sets, so anything
+# carrying real content falls through to the model.
+_TOKEN_RE = re.compile(r"[a-z']+")
+_GREETING_WORDS = frozenset({
+    "hi", "hello", "hey", "hiya", "yo", "sup", "howdy", "greetings",
+    "thanks", "thank", "you", "so", "much", "there",
+    "good", "morning", "afternoon", "evening",
+    "whats", "up", "how", "are", "doing",
+})
+_SIGN_OFF_WORDS = frozenset({
+    "bye", "goodbye", "byebye", "cya", "later", "talk", "to", "soon",
+    "have", "a", "good", "great", "day", "night",
+    "thanks", "thank", "you", "all", "thats", "it", "im", "done", "cheers",
+})
+
+
+def fast_path_guard(message: str) -> GuardResult | None:
+    """Classify greetings and sign-offs without calling the model.
+
+    The guard LLM is a full round trip and measured ~37% of time-to-first-token.
+    Greetings and sign-offs need no retrieval and no distilled keywords, so the
+    model adds latency and nothing else. Returns None for anything ambiguous, which
+    keeps real questions on the model path where keyword distillation and the
+    source filter genuinely matter.
+    """
+    tokens = _TOKEN_RE.findall(message.lower())
+    # A question mark means a real question however short, e.g. "you there?".
+    if not tokens or len(tokens) > 6 or "?" in message:
+        return None
+
+    # Sign-off first: "thanks, that's all" is a farewell, while a bare "thanks" is
+    # small talk. Only the sign-off vocabulary covers the closing words.
+    if set(tokens) <= _SIGN_OFF_WORDS and not set(tokens) <= _GREETING_WORDS:
+        return GuardResult(safety=SafetyVerdict.safe, intent=Intent.end_call, keywords="")
+    if set(tokens) <= _GREETING_WORDS:
+        return GuardResult(safety=SafetyVerdict.safe, intent=Intent.small_talk, keywords="")
+    return None
 
 
 def fallback_guard(message: str, mode: str = "chat") -> GuardResult:
@@ -20,14 +67,16 @@ def fallback_guard(message: str, mode: str = "chat") -> GuardResult:
                 safety=SafetyVerdict.malicious,
                 intent=Intent.rag,
                 keywords="",
-                refusal_reason="The request attempts to override or extract protected instructions.",
+                refusal_reason=(
+                    "The request attempts to override or extract protected instructions."
+                ),
             )
 
-    if any(marker in lowered for marker in ["goodbye", "bye", "talk later", "have a good day"]):
+    if _END_CALL_RE.search(lowered):
         intent = Intent.end_call
-    elif any(marker in lowered for marker in ["book", "schedule", "calendar", "meeting", "call"]):
+    elif _SCHEDULING_RE.search(lowered):
         intent = Intent.scheduling
-    elif any(marker in lowered for marker in ["hi", "hello", "hey", "thanks"]):
+    elif _SMALL_TALK_RE.search(lowered):
         intent = Intent.small_talk
     else:
         intent = Intent.rag
@@ -67,6 +116,11 @@ async def guard_node(
             refusal_reason="The request attempts to override or extract protected instructions.",
         )
         return {**state, "guard": guard}
+
+    # Deterministic short-circuit before the model call.
+    fast = fast_path_guard(raw_input)
+    if fast is not None:
+        return {**state, "guard": fast}
 
     if groq is None:
         guard = fallback_guard(raw_input, mode)

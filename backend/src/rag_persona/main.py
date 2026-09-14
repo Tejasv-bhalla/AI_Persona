@@ -1,27 +1,50 @@
+import hmac
 import json
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
+from uuid import uuid4
 
-import logging
-from fastapi import FastAPI, Request, Header, HTTPException, status
+from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, StreamingResponse
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from rag_persona.config import Settings, get_settings
 from rag_persona.graph import build_graph
-from rag_persona.nodes.generator import stream_generator_node
-from rag_persona.nodes.grader import grade_answer
 from rag_persona.schemas import BookingRequest, ChatEvent, ChatRequest, PersonaState
 from rag_persona.services.calcom import CalComClient
 from rag_persona.services.embeddings import EmbeddingService
 from rag_persona.services.groq_client import GroqClient
 from rag_persona.services.qdrant_store import QdrantStore
-from rag_persona.voice.vapi_adapter import parse_vapi_request, format_vapi_response_stream
+from rag_persona.voice.response_cache import set_cached_response
+from rag_persona.voice.vapi_adapter import format_vapi_response_stream, parse_vapi_request
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
 logger = logging.getLogger(__name__)
 
+# Never surfaced with exception detail: clients get this, the traceback goes to the log.
+GENERIC_ERROR_MESSAGE = "An unexpected error occurred. Please try again."
+
+
+def client_ip(request: Request) -> str:
+    """Rate-limit key. Render sits behind a proxy, so prefer the leftmost X-Forwarded-For hop."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        leftmost = forwarded.split(",", 1)[0].strip()
+        if leftmost:
+            return leftmost
+    return get_remote_address(request)
+
+
+limiter = Limiter(key_func=client_ip)
 
 
 def try_build_services(settings: Settings) -> dict[str, Any]:
@@ -33,14 +56,28 @@ def try_build_services(settings: Settings) -> dict[str, Any]:
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     services = try_build_services(settings)
     app.state.settings = settings
     app.state.services = services
     app.state.graph = build_graph(settings=settings, **services)
+
+    if not settings.vapi_webhook_secret:
+        logger.warning(
+            "vapi_webhook_secret is not configured: /voice endpoints are unauthenticated."
+        )
+    if not settings.eval_api_key:
+        logger.warning("eval_api_key is not configured: /chat/eval is disabled (404).")
+
     yield
 
+    calcom: CalComClient | None = services.get("calcom")
+    if calcom is not None:
+        await calcom.aclose()
+
+
+settings = get_settings()
 
 app = FastAPI(
     title="RAG Persona Backend",
@@ -49,7 +86,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-settings = get_settings()
+app.state.limiter = limiter
+# slowapi's handler is typed against its own concrete exception rather than Exception,
+# which is narrower than Starlette's handler protocol allows.
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -61,6 +102,61 @@ app.add_middleware(
 
 def sse(event: ChatEvent) -> str:
     return f"data: {event.model_dump_json()}\n\n"
+
+
+def turn_state(**overrides: Any) -> PersonaState:
+    """Build the graph input for one turn.
+
+    The checkpointer keeps every key that is not overwritten, which is what carries
+    booking progress across turns of a call. Per-turn keys must therefore be reset
+    explicitly, or a stale answer from the previous turn leaks into this one.
+    """
+    state: PersonaState = {
+        "answer": "",
+        "chunks": [],
+        "route": "",
+        "grounded": True,
+        "retry_count": 0,
+        "available_slots": [],
+    }
+    state.update(overrides)  # type: ignore[typeddict-item]
+    return state
+
+
+def history_dicts(payload: ChatRequest) -> list[dict[str, str]]:
+    """Validated turns back to plain dicts, the shape the nodes and Groq SDK expect."""
+    return [turn.model_dump() for turn in payload.conversation_history]
+
+
+def graph_config(thread_id: str | None) -> dict[str, Any]:
+    """Scope checkpointed state to one conversation; anonymous turns get their own."""
+    return {"configurable": {"thread_id": thread_id or f"anon-{uuid4().hex}"}}
+
+
+def verify_vapi_secret(provided: str | None) -> None:
+    """Require the shared Vapi secret when one is configured; allow through otherwise (dev)."""
+    app_settings: Settings | None = getattr(app.state, "settings", None)
+    expected = app_settings.vapi_webhook_secret if app_settings else ""
+    if not expected:
+        return
+    if provided is None or not hmac.compare_digest(provided, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid x-vapi-secret header",
+        )
+
+
+def verify_eval_key(provided: str | None) -> None:
+    """Eval-only endpoint: hidden entirely unless a key is configured."""
+    app_settings: Settings | None = getattr(app.state, "settings", None)
+    expected = app_settings.eval_api_key if app_settings else ""
+    if not expected:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+    if provided is None or not hmac.compare_digest(provided, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid x-eval-key header",
+        )
 
 
 @app.get("/health")
@@ -84,103 +180,118 @@ async def warm() -> dict[str, str]:
 
 
 @app.post("/chat")
-async def chat(request: ChatRequest) -> StreamingResponse:
+@limiter.limit(settings.rate_limit_chat)
+async def chat(request: Request, payload: ChatRequest) -> StreamingResponse:
     async def events() -> AsyncIterator[str]:
+        final: PersonaState = {}
+        route_sent = False
         try:
-            initial_state: PersonaState = {
-                "raw_input": request.message,
-                "session_id": request.session_id,
-                "conversation_history": request.conversation_history,
-            }
-            state: PersonaState = await app.state.graph.ainvoke(initial_state)
-            yield sse(ChatEvent(type="meta", data=json.dumps({"route": state.get("route", "rag")})))
-
-            answer_parts: list[str] = []
-            async for token in stream_generator_node(
-                state=state,
-                settings=app.state.settings,
-                groq=app.state.services.get("groq"),
-            ):
-                answer_parts.append(token)
-                yield sse(ChatEvent(type="token", data=token))
-
-            answer = "".join(answer_parts)
-            grounded = await grade_answer(
-                state=state,
-                answer=answer,
-                settings=app.state.settings,
-                groq=app.state.services.get("groq"),
+            stream = app.state.graph.astream(
+                turn_state(
+                    raw_input=payload.message,
+                    session_id=payload.session_id,
+                    conversation_history=history_dicts(payload),
+                ),
+                config=graph_config(payload.session_id),
+                stream_mode=["custom", "values"],
             )
+            async for mode, chunk in stream:
+                if mode == "values":
+                    final = chunk
+                    if not route_sent and chunk.get("route"):
+                        route_sent = True
+                        yield sse(
+                            ChatEvent(type="meta", data=json.dumps({"route": chunk["route"]}))
+                        )
+                    continue
+                # A `correction` chunk means the grounding check failed and a fresh
+                # answer is now streaming; the client replaces what it already rendered.
+                yield sse(ChatEvent(type=chunk["type"], data=chunk["text"]))
 
             yield sse(
                 ChatEvent(
                     type="done",
                     data="",
-                    session_id=request.session_id or state.get("session_id"),
-                    grounded=grounded,
-                    available_slots=state.get("available_slots"),
+                    session_id=payload.session_id or final.get("session_id"),
+                    grounded=final.get("grounded", True),
+                    available_slots=final.get("available_slots"),
                 )
             )
         except Exception as e:
-            error_msg = "The Groq API free-tier limit was reached. Please try again in a few minutes."
-            if "rate_limit" not in str(e).lower() and "429" not in str(e):
-                error_msg = f"An unexpected error occurred: {str(e)}"
+            logger.exception("Unhandled error while streaming /chat response")
+            error_msg = GENERIC_ERROR_MESSAGE
+            if "rate_limit" in str(e).lower() or "429" in str(e):
+                error_msg = (
+                    "The Groq API free-tier limit was reached. "
+                    "Please try again in a few minutes."
+                )
             yield sse(ChatEvent(type="error", data=error_msg))
 
     return StreamingResponse(events(), media_type="text/event-stream")
 
 
 @app.post("/chat/eval")
-async def chat_eval(request: ChatRequest) -> dict[str, Any]:
+@limiter.limit(settings.rate_limit_chat)
+async def chat_eval(
+    request: Request,
+    payload: ChatRequest,
+    x_eval_key: str | None = Header(default=None, alias="x-eval-key"),
+) -> dict[str, Any]:
+    verify_eval_key(x_eval_key)
     try:
-        initial_state: PersonaState = {
-            "raw_input": request.message,
-            "session_id": request.session_id,
-            "conversation_history": request.conversation_history,
-        }
-        state: PersonaState = await app.state.graph.ainvoke(initial_state)
-        
-        answer_parts: list[str] = []
-        async for token in stream_generator_node(
-            state=state,
-            settings=app.state.settings,
-            groq=app.state.services.get("groq"),
-        ):
-            answer_parts.append(token)
-        
-        answer = "".join(answer_parts)
-        retrieved_contexts = [chunk.text for chunk in state.get("chunks", [])]
-        
+        final: PersonaState = {}
+        stream = app.state.graph.astream(
+            turn_state(
+                raw_input=payload.message,
+                session_id=payload.session_id,
+                conversation_history=history_dicts(payload),
+            ),
+            config=graph_config(payload.session_id),
+            stream_mode="values",
+        )
+        async for chunk in stream:
+            final = chunk
+
         return {
-            "response": answer,
-            "retrieved_contexts": retrieved_contexts
+            "response": final.get("answer", ""),
+            "retrieved_contexts": [chunk.text for chunk in final.get("chunks", [])],
+            "grounded": final.get("grounded", True),
         }
     except Exception as e:
+        logger.exception("Unhandled error in /chat/eval")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e),
-        )
+            detail=GENERIC_ERROR_MESSAGE,
+        ) from e
 
 
 @app.post("/book")
-async def book_slot(request: BookingRequest) -> dict[str, object]:
+@limiter.limit(settings.rate_limit_book)
+async def book_slot(request: Request, payload: BookingRequest) -> dict[str, object]:
     calcom = app.state.services.get("calcom")
     if calcom is None or not calcom.configured:
         return {"status": "error", "message": "Cal.com client is not configured"}
     try:
-        result = await calcom.create_booking(request)
+        result = await calcom.create_booking(payload)
         return {"status": "success", "booking": result}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+    except Exception:
+        logger.exception("Cal.com booking failed")
+        return {"status": "error", "message": GENERIC_ERROR_MESSAGE}
 
 
 @app.post("/voice")
 @app.post("/voice/chat/completions")
-async def voice_endpoint(request: Request) -> StreamingResponse:
+@limiter.limit(settings.rate_limit_voice)
+async def voice_endpoint(
+    request: Request,
+    x_vapi_secret: str | None = Header(default=None, alias="x-vapi-secret"),
+) -> StreamingResponse:
+    verify_vapi_secret(x_vapi_secret)
+
     try:
         payload = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload") from e
 
     raw_input, history = parse_vapi_request(payload)
 
@@ -188,61 +299,64 @@ async def voice_endpoint(request: Request) -> StreamingResponse:
     call_obj = message_obj.get("call", {}) if isinstance(message_obj, dict) else {}
     if not call_obj and isinstance(payload, dict):
         call_obj = payload.get("call", {})
-    
+
+    call_id = ""
     customer_number = ""
-    if isinstance(call_obj, dict) and isinstance(call_obj.get("customer"), dict):
-        customer_number = call_obj["customer"].get("number", "")
+    if isinstance(call_obj, dict):
+        call_id = str(call_obj.get("id") or "")
+        if isinstance(call_obj.get("customer"), dict):
+            customer_number = call_obj["customer"].get("number", "")
 
-    initial_state: PersonaState = {
-        "raw_input": raw_input,
-        "conversation_history": history,
-        "mode": "voice",
-        "customer_number": customer_number,
-    }
+    app_settings: Settings = app.state.settings
 
-    state: PersonaState = await app.state.graph.ainvoke(initial_state)
-
-    token_stream = stream_generator_node(
-        state=state,
-        settings=app.state.settings,
-        groq=app.state.services.get("groq"),
-    )
-
-    async def cache_accumulator() -> AsyncIterator[str]:
-        full_tokens = []
+    async def token_stream() -> AsyncIterator[str]:
+        final: PersonaState = {}
         try:
-            async for token in token_stream:
-                full_tokens.append(token)
-                yield token
+            # Keying the thread on the Vapi call id is what lets the booking flow
+            # remember which slot was offered and whose name it already collected.
+            stream = app.state.graph.astream(
+                turn_state(
+                    raw_input=raw_input,
+                    conversation_history=history,
+                    mode="voice",
+                    customer_number=customer_number,
+                ),
+                config=graph_config(call_id or customer_number or None),
+                stream_mode=["custom", "values"],
+            )
+            async for mode, chunk in stream:
+                if mode == "values":
+                    final = chunk
+                else:
+                    yield chunk["text"]
         except Exception as e:
             logger.exception("Error occurred during voice session streaming")
-            error_msg = "I'm having a bit of trouble connecting to my brain right now, but please ask again in a moment."
+            error_msg = (
+                "I'm having a bit of trouble connecting to my brain right now, "
+                "but please ask again in a moment."
+            )
             if "rate_limit" in str(e).lower() or "429" in str(e):
-                error_msg = "I am experiencing a high volume of requests right now. Could you please repeat that in a few seconds?"
+                error_msg = (
+                    "I am experiencing a high volume of requests right now. "
+                    "Could you please repeat that in a few seconds?"
+                )
             yield error_msg
             return
 
-        # After streaming completes, cache the full response if it is a new generation
-        if "answer" not in state and state.get("mode") == "voice":
-            guard = state.get("guard")
-            keywords = guard.keywords if guard else None
-            chunks = state.get("chunks", [])
-            query_vector = state.get("query_vector")
-            full_answer = "".join(full_tokens)
-            if keywords and chunks and full_answer:
-                from rag_persona.voice.response_cache import set_cached_response
-                set_cached_response(
-                    key=keywords,
-                    chunks=chunks,
-                    answer=full_answer,
-                    vector=query_vector,
-                )
-
-
-    vapi_stream = format_vapi_response_stream(cache_accumulator())
+        guard = final.get("guard")
+        # Re-writing an entry that was itself a cache hit is harmless: it refreshes
+        # the TTL and its LRU recency, which is what we want for a popular question.
+        if final.get("route") == "rag" and guard and guard.keywords and final.get("answer"):
+            set_cached_response(
+                key=guard.keywords,
+                chunks=final.get("chunks", []),
+                answer=final["answer"],
+                vector=final.get("query_vector"),
+                max_entries=app_settings.voice_cache_max_entries,
+            )
 
     return StreamingResponse(
-        vapi_stream,
+        format_vapi_response_stream(token_stream()),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -256,19 +370,12 @@ async def vapi_webhook(
     request: Request,
     x_vapi_secret: str | None = Header(default=None, alias="x-vapi-secret"),
 ) -> dict[str, str]:
-    settings = getattr(app.state, "settings", None)
-    expected_secret = settings.vapi_webhook_secret if settings else ""
-
-    if expected_secret and x_vapi_secret != expected_secret:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid x-vapi-secret header",
-        )
+    verify_vapi_secret(x_vapi_secret)
 
     try:
         payload = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload") from e
 
     message = payload.get("message", {})
     event_type = message.get("type")
@@ -287,4 +394,3 @@ async def vapi_webhook(
         logger.info(f"Vapi webhook received event: {event_type} for call: {call_id}")
 
     return {"status": "ok"}
-

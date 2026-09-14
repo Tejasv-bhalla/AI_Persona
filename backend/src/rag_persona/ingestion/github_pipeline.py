@@ -9,7 +9,7 @@ from urllib.parse import quote, urlparse
 import httpx
 
 from rag_persona.config import Settings
-from rag_persona.ingestion.bm25 import BM25Encoder
+from rag_persona.ingestion.bm25 import BM25Encoder, SparseVector
 from rag_persona.ingestion.chunkers import (
     CODE_EXTENSIONS,
     NOTEBOOK_EXTENSION,
@@ -102,7 +102,8 @@ async def discover_repositories(
                 is_external=False,
             )
             for repo in response.json()
-            if not repo.get("fork", False) and repo["name"].lower() not in [r.lower() for r in settings.repo_blocklist]
+            if not repo.get("fork", False)
+            and repo["name"].lower() not in [r.lower() for r in settings.repo_blocklist]
         ]
 
 
@@ -134,7 +135,12 @@ def parse_github_url(url: str) -> tuple[str, str]:
     return parts[0], repo
 
 
-async def _get_with_retries(client: httpx.AsyncClient, url: str, headers: dict | None = None, max_retries: int = 3) -> httpx.Response | None:
+async def _get_with_retries(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict[str, str] | None = None,
+    max_retries: int = 3,
+) -> httpx.Response | None:
     backoff = 1.0
     for _ in range(max_retries):
         try:
@@ -335,9 +341,6 @@ async def build_github_knowledge_base(
     reset: bool = True,
     resume_path: Path | None = None,
     data_dir: Path | None = None,
-    incremental: bool = False,
-    concurrent_repos: int = 2,
-    snapshot_name: str | None = None,
 ) -> IngestionReport:
     started = perf_counter()
     warnings: list[str] = []
@@ -368,7 +371,8 @@ async def build_github_knowledge_base(
                 if scope_path is None:
                     raise RuntimeError(
                         f"HARD STOP: Missing contribution scope file for {spec.name}. "
-                        f"Create ingestion/data/contribution_scope_{spec.name.lower()}.md before running ingestion."
+                        f"Create ingestion/data/contribution_scope_{spec.name.lower()}.md "
+                        "before running ingestion."
                     )
                 scope_text = scope_path.read_text(encoding="utf-8", errors="ignore").strip()
 
@@ -429,7 +433,7 @@ async def build_github_knowledge_base(
     dense_vectors = embeddings.embed_many(texts)
     bm25 = BM25Encoder(texts)
     sparse_vectors = [bm25.encode_document(text) for text in texts]
-    payloads = [
+    payloads: list[dict[str, object]] = [
         {
             "chunk_id": chunk.chunk_id,
             "chunk_text": chunk.text,
@@ -440,16 +444,13 @@ async def build_github_knowledge_base(
     ]
 
     # Deduplicate in-memory by chunk_id
-    unique: list[dict] = []
+    unique: list[dict[str, object]] = []
     seen: set[str] = set()
     unique_vectors: list[list[float]] = []
-    unique_sparse: list = []
+    unique_sparse: list[SparseVector] = []
     for p, v, s in zip(payloads, dense_vectors, sparse_vectors, strict=True):
         cid = str(p["chunk_id"])
         if cid in seen:
-            continue
-        # If incremental mode, skip chunks that already exist in the store
-        if incremental and store.point_exists(cid):
             continue
         seen.add(cid)
         unique.append(p)
@@ -460,7 +461,11 @@ async def build_github_knowledge_base(
     if not getattr(settings, "dry_run", False):
         store.upsert_chunks(unique, unique_vectors, sparse_vectors=unique_sparse, batch_size=100)
 
-    validation = validate_index(store=store, embeddings=embeddings) if not getattr(settings, "dry_run", False) else {"dry_run": True}
+    validation = (
+        {"dry_run": True}
+        if is_dry_run
+        else validate_index(store=store, embeddings=embeddings)
+    )
     breakdown: dict[str, int] = {}
     for chunk in all_chunks:
         breakdown[chunk.source_type.value] = breakdown.get(chunk.source_type.value, 0) + 1

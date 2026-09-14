@@ -16,8 +16,9 @@ class EmbeddingService:
         return TextEmbedding(model_name=self.settings.embedding_model)
 
     def embed_one(self, text: str) -> list[float]:
-        vector = next(self.model.embed([text]))
-        return vector.astype(np.float32).tolist()
+        vector = next(iter(self.model.embed([text])))
+        values: list[float] = vector.astype(np.float32).tolist()
+        return values
 
     def embed_many(self, texts: Iterable[str]) -> list[list[float]]:
         return [vector.astype(np.float32).tolist() for vector in self.model.embed(list(texts))]

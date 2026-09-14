@@ -54,15 +54,6 @@ class BM25Encoder:
 
         return SparseVector(indices=indices, values=values)
 
-    def encode_query(self, text: str) -> SparseVector:
-        counts = Counter(tokenize(text))
-        indices: list[int] = []
-        values: list[float] = []
-        for token, frequency in counts.items():
-            indices.append(stable_token_index(token))
-            values.append(float(self.idf.get(token, 1.0) * frequency))
-        return SparseVector(indices=indices, values=values)
-
 
 def stable_token_index(token: str) -> int:
     digest = blake2b(token.encode("utf-8"), digest_size=4).digest()
@@ -70,6 +61,13 @@ def stable_token_index(token: str) -> int:
 
 
 def encode_sparse_query(text: str) -> SparseVector:
+    """Encode a query as raw term frequencies.
+
+    Query weights are deliberately unweighted: `BM25Encoder.encode_document` already bakes
+    IDF and length normalisation into the document vector, so the dot product of a raw-tf
+    query with a document vector is the standard BM25 score. Applying IDF here as well
+    would double-count it.
+    """
     counts = Counter(tokenize(text))
     return SparseVector(
         indices=[stable_token_index(token) for token in counts],

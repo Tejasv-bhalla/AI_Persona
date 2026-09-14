@@ -171,6 +171,13 @@ button:disabled {
 .markdown-body li {
   margin-bottom: 4px;
 }
+/* Loose lists wrap each item in a <p>; keep those tight inside the marker. */
+.markdown-body li > p {
+  margin: 0;
+}
+.markdown-body > :last-child {
+  margin-bottom: 0;
+}
 .markdown-body h1, .markdown-body h2, .markdown-body h3 {
   margin: 16px 0 8px 0;
   font-weight: 700;
@@ -201,9 +208,6 @@ button:disabled {
   padding: 0;
   color: inherit;
   font-family: inherit;
-}
-.paragraph-spacer {
-  height: 8px;
 }
 
 /* Header & Badges */

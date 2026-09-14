@@ -1,6 +1,10 @@
 # INGESTION PIPELINE — Automated GitHub Knowledge Base Builder
-## Addendum to BLUEPRINT.md | Tejasv Bhalla RAG Chatbot
-### Scaler AI Engineer Screening — Part B
+
+Companion to [ARCHITECTURE.md](ARCHITECTURE.md) (runtime graph topology) and
+[DEPLOYMENT.md](DEPLOYMENT.md) (how to run this before a deploy).
+
+Implementation: `backend/src/rag_persona/ingestion/` — `cli.py`, `github_pipeline.py`, `chunkers.py`,
+`bm25.py`, `gitlog.py`.
 
 ---
 
@@ -10,7 +14,7 @@ The ingestion pipeline is a one-time offline process that runs **locally on your
 
 **Input:** GitHub username + explicit list of external repo URLs + local resume file
 **Output:** Fully indexed Qdrant collection ready for hybrid search
-**Estimated runtime:** Under 10 minutes for a portfolio of 5–8 repos
+**Estimated runtime:** Minutes rather than hours for a portfolio of 5–8 repos; the wall time is dominated by one GitHub Contents API call per file and by local ONNX embedding, so it scales with total file count, not repo count
 **Persistence:** Only the Qdrant Cloud collection persists. No local files are kept after ingestion.
 **Clone-free:** All data fetched via GitHub REST API. No git clone required anywhere.
 
@@ -48,15 +52,18 @@ After Qdrant is populated, the original data is gone. The Render backend queries
 
 ```
 ingestion/
-├── data/
-│   ├── resume.pdf                          ← only mandatory manual file right now
-│   ├── contribution_scope_shramik.md       ← write before running (hard-stop if missing)
-│   ├── contribution_scope_jhealth.md       ← write before running (hard-stop if missing)
-│   ├── arch_decisions_repo1.md             ← add later, pipeline warns if missing
-│   └── dev_log_repo1.md                    ← add later, pipeline warns if missing
-├── pipeline.py                             ← the ingestion script
+├── data/                                   ← gitignored; holds a real resume
+│   ├── resume.pdf                          ← or resume.md / resume.txt — mandatory, hard-stop if absent
+│   ├── contribution_scope_<repo>.md        ← write before running (hard-stop for external repos)
+│   ├── arch_decisions_<repo>.md            ← optional, pipeline warns if missing
+│   └── dev_log_<repo>.md                   ← optional, pipeline warns if missing
+├── pipeline.py                             ← thin wrapper: puts backend/src on sys.path, calls the CLI
 └── .env                                    ← local API keys (never committed to git)
 ```
+
+The real implementation lives in the backend package. `ingestion/pipeline.py` exists so the pipeline can
+be run without installing anything; `pip install -e backend` gives the same CLI as a `rag-persona`
+console script. See [CLI Reference](#cli-reference).
 
 ---
 
@@ -127,7 +134,7 @@ The GitHub REST API's list-repositories endpoint is called with your username. I
 
 Contributor and team repos from the explicit list are appended to the discovered list with a boolean flag marking them as externally-sourced. This flag triggers the CONTRIBUTION-SCOPE.md requirement check during document assembly in Stage 3.
 
-**Rate limiting:** Authenticated requests using your personal access token (`public_repo` scope only) allow 5,000 requests per hour. For a portfolio of 5–8 repos running three API calls each, you will consume under 30 requests total — nowhere near the limit.
+**Rate limiting:** Authenticated requests using your personal access token (`public_repo` scope only) allow 5,000 requests per hour. Budget carefully: the pipeline makes a small fixed number of calls per repo (repo metadata, README, recursive tree, commits) **plus one Contents API call per matching file**. A portfolio with a few hundred indexable source files therefore costs a few hundred requests, not thirty. `_get_with_retries` backs off exponentially on 429 and 5xx, so a burst degrades rather than fails, but a very large portfolio can approach the hourly ceiling.
 
 ---
 
@@ -143,11 +150,16 @@ The GitHub raw content API serves the README.md file directly as plain text via 
 https://raw.githubusercontent.com/{username}/{repo}/{branch}/README.md
 ```
 
-If no README.md exists at root, the pipeline checks for README.rst and README.txt as fallbacks. If none exist, the repo is flagged as undocumented in the pipeline log and only source code and changelog are ingested for that repo.
+If no README.md exists at root, the pipeline checks for README.rst and README.txt as fallbacks. If none
+exist, a `"<repo>: README missing"` warning is added to the ingestion report and only source code and
+changelog are ingested for that repo. Warnings are printed at the end of the run; they never halt it.
 
 ### Job B — Source Code Extraction
 
-The GitHub Contents API recursively lists all files in the repository and returns their raw content. No cloning required. The pipeline fetches only files matching target extensions:
+Two APIs are used, not one. The **Git Trees API** (`/git/trees/{branch}?recursive=1`) lists every blob in
+the repository in a single call; the **Contents API** then fetches each surviving file's raw bytes, one
+request per file, with `Accept: application/vnd.github.raw`. No cloning required. Only files matching the
+target extensions are fetched:
 
 | Extension | Type | Splitter Assigned |
 |---|---|---|
@@ -157,23 +169,30 @@ The GitHub Contents API recursively lists all files in the repository and return
 | .go | Go | AST-boundary |
 | .java | Java | AST-boundary |
 | .cpp .c .h | C / C++ | AST-boundary |
-| .md (non-README) | Markdown prose | Header-boundary |
+| .md (non-README) | Markdown prose | Header-boundary, when the filename identifies it as an ADR, dev log or contribution scope; otherwise paragraph-boundary |
 | .ipynb | Jupyter Notebook | Cell-extraction |
-| .txt | Plain text | Sentence-boundary |
+| .txt | Plain text | Paragraph-boundary |
+| .pdf | Resume only (local file) | Section-boundary after `pypdf` text extraction |
 
-**Explicitly excluded — pipeline skips these file types entirely:**
-- node_modules, .git, venv, env, .venv directories
-- Build output directories (dist, build, __pycache__, .next)
-- Binary files of any extension
-- Lock files (package-lock.json, poetry.lock, yarn.lock)
-- Config files (.env, .gitignore, .eslintrc) — no retrievable knowledge
+Routing is by **filename first, extension second** (`detect_source_type` in `chunkers.py`): a file named
+`README.*` is a readme, one containing `changelog`/`git-log` is a changelog, `architecture-decisions`/
+`arch-decisions`/`adr.md` is an ADR, `development-log`/`dev-log`/`devlog` is a dev log,
+`contribution-scope` is a contribution scope, and `resume`/`cv` is a resume — whatever the extension.
+
+**Explicitly excluded — the pipeline skips these before any fetch:**
+- Directories: `.git`, `.venv`, `venv`, `env`, `node_modules`, `__pycache__`, `dist`, `build`, `.next`
+- Lock files: `package-lock.json`, `poetry.lock`, `yarn.lock`, `pnpm-lock.yaml`
+- Config files: `.env`, `.gitignore`, `.eslintrc`, `.prettierrc` — no retrievable knowledge
+- **Anything whose extension is not on the allowed list above.** That is the real binary filter: binaries
+  are excluded because their extensions are not allow-listed, not by content sniffing. As a backstop, a
+  fetched file containing a null byte is discarded after download.
 
 ### Job C — Commit History Extraction
 
 The GitHub Commits API endpoint returns commit history without any cloning:
 
 ```
-https://api.github.com/repos/{username}/{repo}/commits?per_page=50
+https://api.github.com/repos/{owner}/{repo}/commits?per_page=50
 ```
 
 This returns the last 50 commits per repo including: short SHA hash, ISO 8601 timestamp, author name, and full commit message body.
@@ -181,6 +200,8 @@ This returns the last 50 commits per repo including: short SHA hash, ISO 8601 ti
 The raw API response is transformed into a structured changelog.md in memory using this format:
 
 ```
+# Git Changelog — {repo name}
+
 ## Week of {YYYY-MM-DD}
 
 ### {short-hash} · {timestamp}
@@ -243,40 +264,72 @@ Ingesting a team repo or contributor repo without a contribution boundary docume
 
 The splitter is a routing dispatcher, not a universal component. It inspects each file's extension and selects the appropriate splitting strategy. Code files never use sentence-boundary splitting. Prose files never use AST-boundary splitting.
 
-### Strategy 1 — AST-Boundary Splitter (Code Files)
+### Strategy 1 — Definition-Boundary Splitter (Code Files)
 
-Parses the file's abstract syntax tree and identifies top-level nodes as atomic chunk units:
+**Python is the only language parsed with a real AST.** `chunk_code` runs `ast.parse` and emits one chunk
+per `FunctionDef`, `AsyncFunctionDef` and `ClassDef` node, recording `function_name` and `line_start`.
+Files with a syntax error fall through to the regex path.
 
-- Python: function definitions, class definitions, module-level assignments
-- JavaScript / TypeScript: function declarations, arrow functions assigned to variables, class declarations, exported objects
-- Go: function declarations, method declarations, type definitions
-- Java: class declarations, method declarations
+**Every other language uses a regex heuristic** (`chunk_regex_code`), not a parser. The pattern matches:
 
-Each function or class becomes exactly one chunk regardless of size. If a single function exceeds 600 tokens it is kept whole and marked as oversized in payload metadata. It is never bisected — a split function is a semantically broken chunk where the return statement exists in one chunk and the logic in another, making both unretrievable.
+- `function` / `class` declarations, optionally `export`ed or `async` (JS, TS, Java-ish)
+- `const` / `let` / `var` bindings assigned an arrow function
+- `func` / `type` declarations (Go)
+- `class` / `interface` declarations with access modifiers (Java)
+
+This is genuinely approximate: nested definitions, decorators spanning constructs, and unusual formatting
+can produce a chunk boundary in the wrong place. A file with no match at all is indexed as a single chunk.
+Calling it AST parsing for anything but Python would be an overstatement.
+
+Each definition becomes exactly one chunk regardless of size. A definition longer than **3,500 characters**
+is kept whole and flagged `oversized: true` in payload metadata. It is never bisected — a split function is
+a semantically broken chunk where the return statement lives in one chunk and the logic in another, making
+both unretrievable.
 
 ### Strategy 2 — Header-Boundary Splitter (Markdown Files)
 
-Splits on H2 and H3 markdown headers. Each section from one header to the next becomes one chunk. If a section exceeds 600 tokens, paragraph-boundary splitting applies within that section only.
+Splits on H1, H2 and H3 markdown headers (`^#{1,3}\s+`). Each section from one header to the next becomes
+one chunk, tagged with its `section_title`. Any preamble before the first header becomes its own chunk. If
+a section exceeds **2,600 characters**, paragraph-boundary splitting applies within that section only.
 
-Applies to: README.md, ARCHITECTURE-DECISIONS.md, DEVELOPMENT-LOG.md, CONTRIBUTION-SCOPE.md, and any other .md files found in the repo.
+Applies to: READMEs, architecture-decision docs, development logs and contribution-scope docs. Other `.md`
+files fall through to paragraph-boundary splitting.
 
 ### Strategy 3 — Weekly-Boundary Splitter (changelog.md)
 
-Each weekly group of commits becomes one chunk. Single-commit weeks produce one small chunk. High-activity weeks exceeding 600 tokens produce two chunks using paragraph-boundary splitting within the week group.
+Splits on `## Week of <date>` headers. Each weekly group of commits becomes one chunk tagged with a
+`date_range`. Single-commit weeks produce one small chunk. Weeks exceeding **2,600 characters** are split
+further on paragraph boundaries within the week group. A changelog with no weekly headers falls back to
+paragraph-boundary splitting.
 
 ### Strategy 4 — Section-Boundary Splitter (Resume)
 
-Splits on resume section headings: Education, Experience, Projects, Skills, Certifications, Achievements. Each section is one chunk. If the Experience section contains multiple roles and exceeds 600 tokens, each individual role entry becomes its own chunk with the section heading prepended for retrieval context.
+Splits on a fixed list of resume section headings, matched case-insensitively with up to four leading
+`#` characters: `Education`, `Experience`, `Projects`, `Technical Skills`, `Skills`, `Certifications`,
+`Achievements`, `Why I'm the Right Fit…`, `Additional Notes…`.
 
-Supported resume formats: PDF (text extraction), Markdown, plain text. Scanned PDF images are not supported without an OCR preprocessing step.
+Each section becomes one chunk carrying its `section_title`. A section longer than **2,600 characters** is
+split on paragraph boundaries within that section — there is **no per-role splitting logic**; a long
+Experience section is divided by blank lines, not by job entry. If none of the headings match, the whole
+resume falls through to paragraph-boundary splitting, which is the usual outcome for a PDF whose headings
+did not survive text extraction.
+
+Supported resume formats: PDF (text extracted with `pypdf`), Markdown, plain text. Scanned PDF images are
+not supported without an OCR preprocessing step.
 
 ### Strategy 5 — Cell-Extraction Splitter (Jupyter Notebooks)
 
-Code cells are extracted as individual code chunks. Cells exceeding 10 lines are routed through AST-boundary splitting. Cells under 10 lines are kept as single chunks.
+Code cells are extracted as individual code chunks. Cells with more than 10 newlines are routed through
+the code splitter above (treated as Python). Shorter cells are kept whole.
 
-Markdown cells are extracted as prose chunks and routed through sentence-boundary splitting.
+Markdown cells are extracted as prose chunks, split on paragraph boundaries at **2,200 characters**, and
+tagged `source_type: readme`.
 
-Output cells are discarded unless they contain text-format results such as model accuracy numbers, benchmark scores, or evaluation metrics — these are high-value retrieval targets kept as standalone chunks tagged `source_type: notebook-output`.
+Output cells are discarded unless their text matches
+`accuracy|score|loss|metric|f1|auc|precision|recall` (case-insensitive) — those are high-value retrieval
+targets and are kept as standalone chunks tagged `source_type: notebook-output`. Note the consequence:
+`.ipynb` code and output are the only sources whose `source_type` is decided by content rather than
+filename, and an interesting output that does not use one of those words is dropped.
 
 ---
 
@@ -299,7 +352,26 @@ The pipeline creates the collection automatically on first run if it does not ex
 - Distance metric: Cosine
 - Sparse vector name: `bm25`
 
-If the collection already exists (re-ingestion), it is dropped and recreated from scratch. Full refresh, not incremental update.
+If the collection already exists (re-ingestion), it is dropped and recreated from scratch by default.
+`--no-reset` keeps the existing collection and upserts into it.
+
+### Why There Is No Incremental Mode
+
+Full refresh is a deliberate choice, not a missing feature. **BM25 IDF is corpus-global.** `BM25Encoder`
+computes an inverse-document-frequency table across the entire batch of documents it is constructed with,
+and every sparse vector is scored against that table. Appending new chunks means constructing a new
+encoder over the new batch alone, producing a different IDF for the same tokens — the resulting sparse
+vectors are not on the same scale as the ones already in the collection, and the BM25 half of the hybrid
+query silently starts comparing incomparable numbers. Dense vectors would be fine; sparse ones would not.
+
+An earlier `--incremental` flag existed and was removed. It was broken (it called a `QdrantClient` method
+that does not exist) and unsound for the reason above. Two other flags, `--concurrent-repos` and
+`--snapshot-name`, were accepted and never used, and were removed with it. Making incremental ingestion
+correct means either persisting the corpus IDF table and scoring new chunks against it, or moving BM25
+server-side to Qdrant's own sparse-text support — neither is done here.
+
+To remove a single repository's points without a full rebuild, use `scripts/delete_by_repo.py --repo <name>`
+(`--dry-run` reports the match count without deleting).
 
 ### Payload Schema
 
@@ -318,12 +390,22 @@ Every point written to Qdrant carries the following payload fields:
 | contributor_scope | string or null | Summary from CONTRIBUTION-SCOPE.md for external repos |
 | language | string or null | Programming language for code chunks |
 | line_start | integer or null | Starting line number for code chunks |
-| chunk_id | UUID | Unique identifier |
+| chunk_id | string | `"<file path>:<16-hex sha256 of path+index+text>"`. **Not** a UUID — the Qdrant point id is a UUIDv5 derived from it, so re-ingesting identical content overwrites the same point rather than duplicating it |
 | character_count | integer | Length of chunk text |
+| text | string | Duplicate of `chunk_text`; this is the field the retrieval layer reads |
+| title | string or null | Section heading, for header-split chunks |
+| oversized | boolean | True when a single code definition exceeded 3,500 characters |
+| notebook_cell | integer or null | Source cell index, for notebook chunks |
 
 ### Batched Writes
 
-Qdrant writes are batched in groups of 100 points per upsert call. Individual point writes create unnecessary network overhead against a free-tier cluster. Batching reduces total write time by approximately 70%.
+Qdrant writes are batched in groups of 100 points per upsert call. Individual point writes would pay a
+round-trip per chunk against a free-tier cluster, which dominates the write phase for a corpus of a
+thousand-plus chunks. The batch size is a plain constant, not a tuned value, and the speedup has not been
+benchmarked.
+
+Chunks are deduplicated by `chunk_id` in memory before the upsert, so the same file reachable by two
+routes is indexed once.
 
 ---
 
@@ -335,9 +417,14 @@ A validation pass runs three targeted test queries against the freshly indexed c
 
 | Test Query | Target Source Type | Pass Condition |
 |---|---|---|
-| "IIT Roorkee education degree" | resume | At least 1 result above relevance threshold |
-| "function definition implementation" | code | At least 1 result above relevance threshold |
-| "recent commit update change" | changelog | At least 1 result above relevance threshold |
+| "IIT Roorkee education degree" | resume | Top result scores > 0.3 |
+| "function definition implementation" | code | Top result scores > 0.3 |
+| "recent commit update change" | changelog | Top result scores > 0.3 |
+
+These validation searches are dense-only and source-filtered — they confirm each source type is reachable,
+not that retrieval quality is good. Retrieval quality is measured separately; see
+[`../evals_report.md`](../evals_report.md). A `--dry-run` run skips validation entirely and reports
+`{"dry_run": true}`.
 
 If all three pass, the pipeline reports full success with a summary showing total chunks indexed, breakdown by source type, and total pipeline runtime.
 
@@ -355,7 +442,49 @@ If any query returns zero results or sub-threshold scores, the pipeline reports 
 | Contribution scope docs | 5–15 chunks |
 | **Total** | **323–1,010 chunks** |
 
-Typical vector storage for 1,000 chunks at 384 dimensions is approximately 6MB — well within Qdrant Cloud free tier's 1GB RAM cluster capacity.
+The estimates above are planning figures. The **actual** collection at the time of the committed eval run
+(`eval/results/summary.json`) held **1,371 chunks**: 941 code, 276 readme, 87 unknown, 46 notebook-output,
+12 changelog, 5 resume, 4 contribution-scope. Code dominates by an order of magnitude, and the 87 `unknown`
+chunks are files whose name matched none of the source-type rules.
+
+Typical vector storage for 1,000 chunks at 384 dimensions is approximately 6MB — well within Qdrant Cloud
+free tier's 1GB RAM cluster capacity.
+
+---
+
+## CLI REFERENCE
+
+Two entry points, one implementation (`backend/src/rag_persona/ingestion/cli.py`):
+
+```bash
+pip install -e backend && rag-persona <command> ...   # console script
+python ingestion/pipeline.py <command> ...            # no install required
+```
+
+### `github` — the full clone-free pipeline
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--username` | `GITHUB_USERNAME` from env | GitHub account whose public repos are discovered |
+| `--external-repo URL` | none | Repeatable. Adds a repo you do not own; requires a contribution-scope file |
+| `--resume PATH` | first of `resume.pdf`/`.md`/`.txt` in the data dir | Resume file to index |
+| `--data-dir PATH` | `ingestion/data` | Where the manual files live |
+| `--no-reset` | off | Upsert into the existing collection instead of dropping it |
+| `--dry-run` | off | Run discovery, fetching, chunking and embedding; skip the Qdrant upsert and validation |
+
+### `ingest` — index a local directory
+
+`--source PATH` (required), `--repo-name NAME` (required), `--reset`, `--confirm-local`.
+Ingesting `.` is refused without `--confirm-local`, so the pipeline cannot accidentally index this
+repository into its own knowledge base.
+
+### `changelog` — build a changelog from a local git clone
+
+`--repo PATH` (required), `--output PATH` (required), `--limit N` (default 50). Only needed when a repo is
+not reachable through the GitHub API; the `github` command generates changelogs itself.
+
+There are no `--incremental`, `--concurrent-repos` or `--snapshot-name` flags. They were removed; see
+[Why There Is No Incremental Mode](#why-there-is-no-incremental-mode).
 
 ---
 
@@ -369,9 +498,16 @@ GITHUB_USERNAME=your-github-handle
 QDRANT_URL=https://your-cluster-url.cloud.qdrant.io
 QDRANT_API_KEY=your-qdrant-api-key
 QDRANT_COLLECTION=tejasv_knowledge_base
+
+# Optional: JSON list of repo names to skip during discovery
+REPO_BLOCKLIST=["AI_Persona"]
 ```
 
 The GitHub token requires only `public_repo` scope. Nothing else.
+
+`REPO_BLOCKLIST` matters more than it looks. Without it the pipeline discovers and indexes its own
+repository, and the persona starts answering resume questions with its own source code. Forks are skipped
+automatically.
 
 ---
 
@@ -391,15 +527,17 @@ Re-ingestion drops and rebuilds the Qdrant collection from scratch. Full re-inge
 
 ## MINIMUM VIABLE CHECKLIST BEFORE FIRST RUN
 
-- [ ] `resume.pdf` placed in `ingestion/data/`
-- [ ] `contribution_scope_shramik.md` written and placed in `ingestion/data/` — **hard-stop if missing**
-- [ ] `contribution_scope_jhealth.md` written and placed in `ingestion/data/` — **hard-stop if missing**
+- [ ] `resume.pdf` (or `.md` / `.txt`) placed in `ingestion/data/`
+- [ ] `contribution_scope_<repo>.md` written for **every** repo passed with `--external-repo` — **hard-stop if missing**
 - [ ] GitHub personal access token generated with `public_repo` scope only
 - [ ] Qdrant Cloud cluster created and URL + API key noted
 - [ ] All five environment variables set in local `.env` file
+- [ ] `REPO_BLOCKLIST` set to exclude this repository
+- [ ] Rehearsed once with `--dry-run` before writing to a live collection
 
 ---
 
 *This document covers the automated offline ingestion process only.*
-*Runtime retrieval architecture, graph topology, and latency analysis are documented in BLUEPRINT.md.*
+*Runtime retrieval architecture and graph topology are documented in [ARCHITECTURE.md](ARCHITECTURE.md);*
+*retrieval quality measurements live in [`../evals_report.md`](../evals_report.md).*
 *The Render backend has no dependency on this pipeline at runtime.*
